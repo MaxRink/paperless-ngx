@@ -725,7 +725,7 @@ class TestDocumentUpdatedSignalTriggersLlmReindex:
         doc = DocumentFactory()
         document_updated.send(sender=object, document=doc)
 
-        mock_task.apply_async.assert_called_once_with(kwargs={"document": doc})
+        mock_task.apply_async.assert_called_once_with(kwargs={"document": doc.pk})
 
     @pytest.mark.django_db
     @override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")
@@ -923,6 +923,26 @@ class TestLlmIndexLocking:
         doc = MagicMock(spec=Document)
         doc.id = 1
         indexing.llm_index_remove_document(doc)
+
+        mock_store.delete.assert_called_once_with("1")
+
+    def test_remove_document_accepts_serialized_primary_key(
+        self,
+        temp_llm_index_dir: Path,
+        mocker: pytest_mock.MockerFixture,
+    ) -> None:
+        """A post-delete Celery task can remove by ID after the row is gone."""
+        mock_store = MagicMock()
+        mock_store.has_pending_migration.return_value = False
+        mocker.patch(
+            "paperless_ai.indexing.write_store",
+            return_value=mocker.MagicMock(
+                __enter__=mocker.MagicMock(return_value=mock_store),
+                __exit__=mocker.MagicMock(return_value=False),
+            ),
+        )
+
+        indexing.llm_index_remove_document(1)
 
         mock_store.delete.assert_called_once_with("1")
 

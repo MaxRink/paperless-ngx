@@ -795,16 +795,24 @@ def apply_ai_suggestions(self, action_id: int, document_id: int) -> None:
 
     ai_config = AIConfig()
     if ai_config.llm_index_enabled:
-        update_document_in_llm_index.apply_async(kwargs={"document": document})
+        update_document_in_llm_index.apply_async(kwargs={"document": document.pk})
 
 
 @shared_task
-def update_document_in_llm_index(document) -> None:
+def update_document_in_llm_index(document: Document | int) -> None:
+    """Update one document in the LLM index.
+
+    Celery serializes Django model instances as their primary-key value. Keep
+    accepting a ``Document`` for direct in-process callers, but normalize the
+    serialized task payload back to the model before indexing.
+    """
+    if isinstance(document, int):
+        document = Document.objects.get(pk=document)
     llm_index_add_or_update_document(document)
 
 
 @shared_task
-def remove_document_from_llm_index(document) -> None:
+def remove_document_from_llm_index(document: Document | int) -> None:
     llm_index_remove_document(document)
 
 

@@ -583,8 +583,14 @@ def llm_index_compact() -> None:
         _with_exclusive_access("compaction", lambda: store.compact(force=True))
 
 
-def llm_index_remove_document(document: Document):
-    """Remove a document's chunks from the LLM index."""
+def llm_index_remove_document(document: Document | int):
+    """Remove a document's chunks from the LLM index.
+
+    Celery serializes model instances as their primary-key value. Deletion
+    signals also run after the database row is gone, so an integer payload
+    must be handled without trying to reload the ``Document``.
+    """
+    document_id = document.id if isinstance(document, Document) else document
     with write_store() as store:
         migration_result = _check_and_run_migrations(store)
         if migration_result is MigrationCheckResult.REEMBED_REQUIRED:
@@ -592,7 +598,7 @@ def llm_index_remove_document(document: Document):
                 "Skipping removal of document %s from the LLM index: the "
                 "index requires re-embedding first. Run 'document_llmindex "
                 "rebuild' to resolve.",
-                document.id,
+                document_id,
             )
             return
         if migration_result is MigrationCheckResult.DEFERRED:
@@ -600,10 +606,10 @@ def llm_index_remove_document(document: Document):
                 "Skipping removal of document %s from the LLM index: "
                 "migration check deferred while index readers are active; "
                 "will retry on the next write.",
-                document.id,
+                document_id,
             )
             return
-        store.delete(str(document.id))
+        store.delete(str(document_id))
 
 
 def truncate_content(

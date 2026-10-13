@@ -1,3 +1,4 @@
+import json
 import shutil
 from datetime import timedelta
 from pathlib import Path
@@ -473,6 +474,29 @@ class TestAIIndex(DirectoriesMixin, TestCase):
             tasks.update_document_in_llm_index(doc)
             llm_index_add_or_update_document.assert_called_once_with(doc)
 
+    def test_update_document_in_llm_index_loads_serialized_primary_key(self) -> None:
+        """A JSON/Celery integer payload is normalized before indexing."""
+        doc = Document.objects.create(
+            title="test",
+            content="my document",
+            checksum="serialized-document",
+        )
+        with mock.patch(
+            "documents.tasks.llm_index_add_or_update_document",
+        ) as llm_index_add_or_update_document:
+            serialized_pk = json.loads(json.dumps(doc.pk))
+            tasks.update_document_in_llm_index(serialized_pk)
+            llm_index_add_or_update_document.assert_called_once_with(doc)
+
+    def test_update_document_in_llm_index_rejects_missing_primary_key(self) -> None:
+        """A stale queued task must fail clearly instead of indexing an integer."""
+        with mock.patch(
+            "documents.tasks.llm_index_add_or_update_document",
+        ) as llm_index_add_or_update_document:
+            with self.assertRaises(Document.DoesNotExist):
+                tasks.update_document_in_llm_index(987654321)
+            llm_index_add_or_update_document.assert_not_called()
+
     def test_remove_document_from_llm_index(self) -> None:
         """
         GIVEN:
@@ -492,6 +516,22 @@ class TestAIIndex(DirectoriesMixin, TestCase):
         ) as llm_index_remove_document:
             tasks.remove_document_from_llm_index(doc)
             llm_index_remove_document.assert_called_once_with(doc)
+
+    def test_remove_document_from_llm_index_accepts_serialized_primary_key(
+        self,
+    ) -> None:
+        """A post-delete task must remove by ID without reloading the row."""
+        doc = Document.objects.create(
+            title="test",
+            content="my document",
+            checksum="serialized-delete-document",
+        )
+        serialized_pk = json.loads(json.dumps(doc.pk))
+        with mock.patch(
+            "documents.tasks.llm_index_remove_document",
+        ) as llm_index_remove_document:
+            tasks.remove_document_from_llm_index(serialized_pk)
+            llm_index_remove_document.assert_called_once_with(serialized_pk)
 
     @override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")
     def test_bulk_update_does_not_enqueue_per_doc_llm_tasks(self) -> None:
@@ -608,7 +648,9 @@ class TestApplyAISuggestionsTask(DirectoriesMixin, TestCase):
         ):
             tasks.apply_ai_suggestions(self.action.pk, self.doc.pk)
 
-        update_in_llm_index.apply_async.assert_called_once()
+        update_in_llm_index.apply_async.assert_called_once_with(
+            kwargs={"document": self.doc.pk},
+        )
 
     def test_deleted_document_is_a_noop(self) -> None:
         """
