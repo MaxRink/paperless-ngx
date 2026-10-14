@@ -1,4 +1,3 @@
-import json
 import shutil
 from datetime import timedelta
 from pathlib import Path
@@ -22,6 +21,8 @@ from documents.tests.helpers import dummy_preprocess
 from paperless_testing.assertions import FileSystemAssertsMixin
 from paperless_testing.dirs import DirectoriesMixin
 from paperless_testing.factories import DocumentFactory
+from paperless.signed_pickle import signed_pickle_dumps
+from paperless.signed_pickle import signed_pickle_loads
 
 
 @pytest.mark.django_db
@@ -474,19 +475,30 @@ class TestAIIndex(DirectoriesMixin, TestCase):
             tasks.update_document_in_llm_index(doc)
             llm_index_add_or_update_document.assert_called_once_with(doc)
 
-    def test_update_document_in_llm_index_loads_serialized_primary_key(self) -> None:
-        """A JSON/Celery integer payload is normalized before indexing."""
+    def test_update_document_in_llm_index_loads_current_document_for_primary_key(
+        self,
+    ) -> None:
+        """A primary-key payload reloads data changed after task publication."""
         doc = Document.objects.create(
-            title="test",
-            content="my document",
+            title="before",
+            content="before",
             checksum="serialized-document",
         )
+        # The real Celery serializer is signed pickle, which preserves a model
+        # snapshot.  Demonstrate why the task producer sends a primary key.
+        stale_snapshot = signed_pickle_loads(signed_pickle_dumps(doc))
+        Document.objects.filter(pk=doc.pk).update(title="after", content="after")
+        doc.refresh_from_db()
         with mock.patch(
             "documents.tasks.llm_index_add_or_update_document",
         ) as llm_index_add_or_update_document:
-            serialized_pk = json.loads(json.dumps(doc.pk))
-            tasks.update_document_in_llm_index(serialized_pk)
+            tasks.update_document_in_llm_index(stale_snapshot)
+            llm_index_add_or_update_document.assert_called_once_with(stale_snapshot)
+            llm_index_add_or_update_document.reset_mock()
+            tasks.update_document_in_llm_index(stale_snapshot.pk)
             llm_index_add_or_update_document.assert_called_once_with(doc)
+            self.assertEqual(stale_snapshot.title, "before")
+            self.assertEqual(stale_snapshot.content, "before")
 
     def test_update_document_in_llm_index_rejects_missing_primary_key(self) -> None:
         """A stale queued task must fail clearly instead of indexing an integer."""
@@ -526,12 +538,11 @@ class TestAIIndex(DirectoriesMixin, TestCase):
             content="my document",
             checksum="serialized-delete-document",
         )
-        serialized_pk = json.loads(json.dumps(doc.pk))
         with mock.patch(
             "documents.tasks.llm_index_remove_document",
         ) as llm_index_remove_document:
-            tasks.remove_document_from_llm_index(serialized_pk)
-            llm_index_remove_document.assert_called_once_with(serialized_pk)
+            tasks.remove_document_from_llm_index(doc.pk)
+            llm_index_remove_document.assert_called_once_with(doc.pk)
 
     @override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")
     def test_bulk_update_does_not_enqueue_per_doc_llm_tasks(self) -> None:

@@ -586,9 +586,9 @@ def llm_index_compact() -> None:
 def llm_index_remove_document(document: Document | int):
     """Remove a document's chunks from the LLM index.
 
-    Celery serializes model instances as their primary-key value. Deletion
-    signals also run after the database row is gone, so an integer payload
-    must be handled without trying to reload the ``Document``.
+    Deletion signals run after the database row is gone, so the task receives
+    a primary key and removes by ID without trying to reload the ``Document``.
+    Direct callers may still provide a model instance.
     """
     document_id = document.id if isinstance(document, Document) else document
     with write_store() as store:

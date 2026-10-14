@@ -802,9 +802,10 @@ def apply_ai_suggestions(self, action_id: int, document_id: int) -> None:
 def update_document_in_llm_index(document: Document | int) -> None:
     """Update one document in the LLM index.
 
-    Celery serializes Django model instances as their primary-key value. Keep
-    accepting a ``Document`` for direct in-process callers, but normalize the
-    serialized task payload back to the model before indexing.
+    The configured signed-pickle Celery serializer preserves model instances,
+    which can leave a queued task with a stale document snapshot.  Producers
+    therefore pass the primary key; reload it here before indexing.  Keep
+    accepting a ``Document`` for direct in-process callers.
     """
     if isinstance(document, int):
         document = Document.objects.get(pk=document)
