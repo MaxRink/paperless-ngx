@@ -75,10 +75,10 @@ from paperless.config import RemoteOCRConfig
 from paperless.logging import consume_task_id
 from paperless.parsers import ParserContext
 from paperless.parsers.registry import get_parser_registry
+from paperless_ai.exceptions import EmbeddingRateLimitError
 from paperless_ai.exceptions import LLMTimeoutError
 from paperless_ai.indexing import llm_index_add_or_update_document
 from paperless_ai.indexing import llm_index_remove_document
-from paperless_ai.indexing import update_llm_index
 
 if settings.AUDIT_LOG_ENABLED:
     from auditlog.models import LogEntry
@@ -317,9 +317,8 @@ def bulk_update_documents(document_ids) -> None:
 
     document_ids = list(document_ids)
     # Annotated so the signal handlers below (e.g. matching) don't query the
-    # versions of each document. Indexing re-queries and re-annotates its own
-    # copy via add_or_update_ids() below, after these signals (and any
-    # workflow they trigger) have had a chance to mutate the documents.
+    # versions of each document. The dedicated index task re-queries and
+    # re-annotates its own copy after these signals and workflows complete.
     documents = annotate_effective_content(
         Document.objects.filter(id__in=document_ids),
     )
@@ -330,7 +329,7 @@ def bulk_update_documents(document_ids) -> None:
             sender=None,
             document=doc,
             logging_group=uuid.uuid4(),
-            skip_ai_index=True,  # bulk path calls update_llm_index once below
+            skip_ai_index=True,  # bulk path enqueues one index task below
         )
         post_save.send(Document, instance=doc, created=False)
 
@@ -339,9 +338,10 @@ def bulk_update_documents(document_ids) -> None:
 
     ai_config = AIConfig()
     if ai_config.llm_index_enabled:
-        update_llm_index(
-            rebuild=False,
-            document_ids=document_ids,
+        # Keep embedding quota waits out of this task. The document updates
+        # above are already committed; the dedicated index task owns retries.
+        llmindex_index.apply_async(
+            kwargs={"rebuild": False, "document_ids": document_ids},
         )
 
 
@@ -499,7 +499,9 @@ def update_document_content_maybe_archive_file(
 
             ai_config = AIConfig()
             if ai_config.llm_index_enabled:
-                llm_index_add_or_update_document(document)
+                update_document_in_llm_index.apply_async(
+                    kwargs={"document": document},
+                )
 
             clear_document_caches(document.pk)
 
@@ -738,11 +740,13 @@ def update_document_parent_tags(tag: Tag, new_parent: Tag) -> None:
         )
 
 
-@shared_task
+@shared_task(bind=True)
 def llmindex_index(
+    self,
     *,
     iter_wrapper: IterWrapper[Document] = identity,
     rebuild: bool = False,
+    document_ids: list[int] | None = None,
 ) -> str | None:
     ai_config = AIConfig()
     if not ai_config.llm_index_enabled:  # pragma: no cover
@@ -751,10 +755,30 @@ def llmindex_index(
 
     from paperless_ai.indexing import update_llm_index
 
-    return update_llm_index(
-        iter_wrapper=iter_wrapper,
-        rebuild=rebuild,
-    )
+    try:
+        return update_llm_index(
+            iter_wrapper=iter_wrapper,
+            rebuild=rebuild,
+            document_ids=document_ids,
+        )
+    except EmbeddingRateLimitError as exc:
+        # Completed documents are persisted before the next one is embedded;
+        # resume incrementally so a long provider window does not replay them.
+        raise self.retry(
+            exc=exc,
+            countdown=exc.retry_after,
+            kwargs={
+                "rebuild": False,
+                # A scoped request may have been promoted to a full rebuild
+                # because the stored embedding model changed. Resume the
+                # complete index in that case, while existing rows are still
+                # skipped by their modified timestamps.
+                "document_ids": (
+                    None if getattr(exc, "full_rebuild", False) else document_ids
+                ),
+            },
+            max_retries=3,
+        )
 
 
 @shared_task(
@@ -796,9 +820,12 @@ def apply_ai_suggestions(self, action_id: int, document_id: int) -> None:
         update_document_in_llm_index.apply_async(kwargs={"document": document})
 
 
-@shared_task
-def update_document_in_llm_index(document) -> None:
-    llm_index_add_or_update_document(document)
+@shared_task(bind=True)
+def update_document_in_llm_index(self, document) -> None:
+    try:
+        llm_index_add_or_update_document(document)
+    except EmbeddingRateLimitError as exc:
+        raise self.retry(exc=exc, countdown=exc.retry_after, max_retries=3)
 
 
 @shared_task
