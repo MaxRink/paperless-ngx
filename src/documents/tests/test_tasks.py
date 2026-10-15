@@ -3,6 +3,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
+from celery.exceptions import Retry
 import pytest
 from django.conf import settings
 from django.test import TestCase
@@ -474,6 +475,29 @@ class TestAIIndex(DirectoriesMixin, TestCase):
         ) as llm_index_add_or_update_document:
             tasks.update_document_in_llm_index(doc)
             llm_index_add_or_update_document.assert_called_once_with(doc)
+
+    def test_embedding_rate_limit_retries_without_terminal_failure(self) -> None:
+        """Provider cooldowns remain Celery retries after repeated attempts."""
+        doc = Document.objects.create(
+            title="test",
+            content="my document",
+            checksum="cooldown",
+        )
+        error = tasks.EmbeddingRateLimitError(21)
+        task = tasks.update_document_in_llm_index
+        retry = mock.Mock(side_effect=Retry())
+        with mock.patch(
+            "documents.tasks.llm_index_add_or_update_document",
+            side_effect=error,
+        ), mock.patch.object(task, "retry", retry):
+            with self.assertRaises(Retry):
+                task.run(doc)
+        retry.assert_called_once_with(
+            exc=error,
+            countdown=21,
+            max_retries=None,
+        )
+        self.assertIsNone(tasks.update_document_in_llm_index.max_retries)
 
     def test_remove_document_from_llm_index(self) -> None:
         """

@@ -824,12 +824,15 @@ def apply_ai_suggestions(self, action_id: int, document_id: int) -> None:
         update_document_in_llm_index.apply_async(kwargs={"document": document})
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, max_retries=None)
 def update_document_in_llm_index(self, document) -> None:
     try:
         llm_index_add_or_update_document(document)
     except EmbeddingRateLimitError as exc:
-        raise self.retry(exc=exc, countdown=exc.retry_after, max_retries=3)
+        # Provider cooldowns are transient and must not become terminal task
+        # failures after three attempts.  Celery's unlimited retry policy is
+        # still bounded by the provider's retry-after delay.
+        raise self.retry(exc=exc, countdown=exc.retry_after, max_retries=None)
 
 
 @shared_task
