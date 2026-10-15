@@ -1,6 +1,7 @@
 import datetime
 import logging
 import shutil
+import time
 import uuid
 import zipfile
 from collections.abc import Callable
@@ -83,6 +84,34 @@ from paperless_ai.indexing import llm_index_remove_document
 if settings.AUDIT_LOG_ENABLED:
     from auditlog.models import LogEntry
 logger = logging.getLogger("paperless.tasks")
+
+_EMBEDDING_RETRY_WAKEUP_SECONDS = 300
+_EMBEDDING_PROVIDER_MAX_ATTEMPTS = 3
+
+
+def _defer_embedding_retry(
+    task: Task,
+    exc: EmbeddingRateLimitError,
+    *,
+    kwargs: dict[str, object],
+) -> None:
+    """Wake an embedding task in short ETAs until the provider window ends.
+
+    Redis visibility timeouts are commonly one hour.  Scheduling a single ETA
+    for a provider's multi-hour window can therefore redeliver the original
+    message before its ETA.  Short wakeups avoid that lease problem while the
+    absolute ``not_before`` timestamp preserves the provider's full window.
+    ``provider_attempts`` is separate from Celery's wakeup retry counter.
+    """
+    now = time.time()
+    not_before = float(kwargs["not_before"])
+    delay = max(0.0, min(_EMBEDDING_RETRY_WAKEUP_SECONDS, not_before - now))
+    raise task.retry(
+        exc=exc,
+        countdown=delay,
+        kwargs=kwargs,
+        max_retries=None,
+    )
 
 
 @shared_task
@@ -500,7 +529,7 @@ def update_document_content_maybe_archive_file(
             ai_config = AIConfig()
             if ai_config.llm_index_enabled:
                 update_document_in_llm_index.apply_async(
-                    kwargs={"document": document},
+                    kwargs={"document_id": document.pk},
                 )
 
             clear_document_caches(document.pk)
@@ -747,6 +776,8 @@ def llmindex_index(
     iter_wrapper: IterWrapper[Document] = identity,
     rebuild: bool = False,
     document_ids: list[int] | None = None,
+    provider_attempts: int = 0,
+    not_before: float | None = None,
 ) -> str | None:
     ai_config = AIConfig()
     if not ai_config.llm_index_enabled:  # pragma: no cover
@@ -755,6 +786,18 @@ def llmindex_index(
 
     from paperless_ai.indexing import update_llm_index
 
+    if not_before is not None and time.time() < not_before:
+        _defer_embedding_retry(
+            self,
+            EmbeddingRateLimitError(not_before - time.time()),
+            kwargs={
+                "rebuild": False,
+                "document_ids": document_ids,
+                "provider_attempts": provider_attempts,
+                "not_before": not_before,
+            },
+        )
+
     try:
         return update_llm_index(
             iter_wrapper=iter_wrapper,
@@ -762,11 +805,13 @@ def llmindex_index(
             document_ids=document_ids,
         )
     except EmbeddingRateLimitError as exc:
+        if provider_attempts >= _EMBEDDING_PROVIDER_MAX_ATTEMPTS:
+            raise
         # Completed documents are persisted before the next one is embedded;
         # resume incrementally so a long provider window does not replay them.
-        raise self.retry(
-            exc=exc,
-            countdown=exc.retry_after,
+        _defer_embedding_retry(
+            self,
+            exc,
             kwargs={
                 "rebuild": False,
                 # A scoped request may have been promoted to a full rebuild
@@ -776,8 +821,9 @@ def llmindex_index(
                 "document_ids": (
                     None if getattr(exc, "full_rebuild", False) else document_ids
                 ),
+                "provider_attempts": provider_attempts + 1,
+                "not_before": time.time() + exc.retry_after,
             },
-            max_retries=3,
         )
 
 
@@ -817,15 +863,42 @@ def apply_ai_suggestions(self, action_id: int, document_id: int) -> None:
 
     ai_config = AIConfig()
     if ai_config.llm_index_enabled:
-        update_document_in_llm_index.apply_async(kwargs={"document": document})
+        update_document_in_llm_index.apply_async(kwargs={"document_id": document.pk})
 
 
 @shared_task(bind=True)
-def update_document_in_llm_index(self, document) -> None:
+def update_document_in_llm_index(
+    self,
+    document_id: int,
+    *,
+    provider_attempts: int = 0,
+    not_before: float | None = None,
+) -> None:
+    document = Document.objects.get(pk=document_id)
+    if not_before is not None and time.time() < not_before:
+        _defer_embedding_retry(
+            self,
+            EmbeddingRateLimitError(not_before - time.time()),
+            kwargs={
+                "document_id": document_id,
+                "provider_attempts": provider_attempts,
+                "not_before": not_before,
+            },
+        )
     try:
         llm_index_add_or_update_document(document)
     except EmbeddingRateLimitError as exc:
-        raise self.retry(exc=exc, countdown=exc.retry_after, max_retries=3)
+        if provider_attempts >= _EMBEDDING_PROVIDER_MAX_ATTEMPTS:
+            raise
+        _defer_embedding_retry(
+            self,
+            exc,
+            kwargs={
+                "document_id": document_id,
+                "provider_attempts": provider_attempts + 1,
+                "not_before": time.time() + exc.retry_after,
+            },
+        )
 
 
 @shared_task

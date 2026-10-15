@@ -21,6 +21,7 @@ from documents.models import Document
 from documents.models import DocumentType
 from documents.models import Note
 from documents.models import PaperlessTask
+from documents import tasks as document_tasks
 from documents.signals import document_consumption_finished
 from documents.signals import document_updated
 from paperless.models import ApplicationConfiguration
@@ -104,6 +105,42 @@ def test_embedding_checkpoint_write_cleans_temporary_file_on_error(
     with pytest.raises(RuntimeError, match="simulated checkpoint"):
         indexing._write_embedding_checkpoint(checkpoint, [[1.0, 2.0]])
     assert list(tmp_path.iterdir()) == []
+
+
+def test_embedding_task_uses_short_wakeups_without_calling_provider(
+    monkeypatch,
+) -> None:
+    class RetrySignal(Exception):
+        pass
+
+    class Task:
+        def __init__(self):
+            self.calls = []
+
+        def retry(self, **kwargs):
+            self.calls.append(kwargs)
+            raise RetrySignal
+
+    task = Task()
+    monkeypatch.setattr(document_tasks.time, "time", lambda: 100.0)
+    with patch("paperless_ai.indexing.update_llm_index") as update:
+        with pytest.raises(RetrySignal):
+            document_tasks.llmindex_index.run(
+                task,
+                rebuild=False,
+                document_ids=[7],
+                provider_attempts=1,
+                not_before=7_300.0,
+            )
+    update.assert_not_called()
+    assert task.calls[0]["countdown"] == 300
+    assert task.calls[0]["max_retries"] is None
+    assert task.calls[0]["kwargs"] == {
+        "rebuild": False,
+        "document_ids": [7],
+        "provider_attempts": 1,
+        "not_before": 7_300.0,
+    }
 
 
 def test_embedding_checkpoint_resumes_after_provider_window(tmp_path, monkeypatch) -> None:
@@ -754,7 +791,7 @@ class TestDocumentUpdatedSignalTriggersLlmReindex:
         doc = DocumentFactory()
         document_updated.send(sender=object, document=doc)
 
-        mock_task.apply_async.assert_called_once_with(kwargs={"document": doc})
+        mock_task.apply_async.assert_called_once_with(kwargs={"document_id": doc.pk})
 
     @pytest.mark.django_db
     @override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")

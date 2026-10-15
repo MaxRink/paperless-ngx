@@ -395,7 +395,7 @@ class TestAIIndex(DirectoriesMixin, TestCase):
         with mock.patch(
             "documents.tasks.llm_index_add_or_update_document",
         ) as llm_index_add_or_update_document:
-            tasks.update_document_in_llm_index(doc)
+            tasks.update_document_in_llm_index(doc.pk)
             llm_index_add_or_update_document.assert_called_once_with(doc)
 
     def test_remove_document_from_llm_index(self) -> None:
