@@ -769,7 +769,7 @@ def update_document_parent_tags(tag: Tag, new_parent: Tag) -> None:
         )
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, max_retries=None)
 def llmindex_index(
     self,
     *,
@@ -805,7 +805,7 @@ def llmindex_index(
             document_ids=document_ids,
         )
     except EmbeddingRateLimitError as exc:
-        if provider_attempts >= _EMBEDDING_PROVIDER_MAX_ATTEMPTS:
+        if provider_attempts >= _EMBEDDING_PROVIDER_MAX_ATTEMPTS - 1:
             raise
         # Completed documents are persisted before the next one is embedded;
         # resume incrementally so a long provider window does not replay them.
@@ -866,14 +866,23 @@ def apply_ai_suggestions(self, action_id: int, document_id: int) -> None:
         update_document_in_llm_index.apply_async(kwargs={"document_id": document.pk})
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, max_retries=None)
 def update_document_in_llm_index(
     self,
-    document_id: int,
+    document_id: int | Document | None = None,
     *,
+    document: Document | None = None,
     provider_attempts: int = 0,
     not_before: float | None = None,
 ) -> None:
+    # Accept old queued messages that carried a pickled Document while all new
+    # producers use a primary key. Always reload by primary key before work.
+    if document is not None:
+        document_id = document.pk
+    elif document_id is not None and not isinstance(document_id, int):
+        document_id = document_id.pk
+    if document_id is None:
+        raise ValueError("document_id is required")
     document = Document.objects.get(pk=document_id)
     if not_before is not None and time.time() < not_before:
         _defer_embedding_retry(
@@ -888,7 +897,7 @@ def update_document_in_llm_index(
     try:
         llm_index_add_or_update_document(document)
     except EmbeddingRateLimitError as exc:
-        if provider_attempts >= _EMBEDDING_PROVIDER_MAX_ATTEMPTS:
+        if provider_attempts >= _EMBEDDING_PROVIDER_MAX_ATTEMPTS - 1:
             raise
         _defer_embedding_retry(
             self,
