@@ -383,7 +383,10 @@ def _embedding_retry_delay(exc: Exception) -> float | None:
         raw = headers.get("retry-after") or headers.get("Retry-After")
         if raw:
             try:
-                return max(1.0, float(raw))
+                value = float(raw)
+                if not math.isfinite(value):
+                    raise ValueError
+                return max(1.0, value)
             except (TypeError, ValueError):
                 try:
                     return max(
@@ -508,14 +511,31 @@ def _embed_nodes(
         type(embed_model).__name__,
     )
     checkpoint_dir = Path(settings.SCRATCH_DIR) / "embedding-checkpoints"
-    checkpoint_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _prune_embedding_checkpoints(checkpoint_dir)
+    try:
+        checkpoint_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _prune_embedding_checkpoints(checkpoint_dir)
+    except OSError:
+        # Checkpointing is an optimization. A read-only or unavailable
+        # scratch directory must not turn a successful provider response into
+        # a failed embedding task.
+        checkpoint_dir = None
     checkpoint_paths = []
     for start in range(0, len(texts), batch_size):
         batch = texts[start : start + batch_size]
-        checkpoint = _embedding_checkpoint_path(model_name, batch)
-        checkpoint_paths.append(checkpoint)
-        cached = _read_embedding_checkpoint(checkpoint, len(batch))
+        if checkpoint_dir is not None:
+            try:
+                checkpoint = _embedding_checkpoint_path(model_name, batch)
+            except OSError:
+                checkpoint = None
+        else:
+            checkpoint = None
+        if checkpoint is not None:
+            checkpoint_paths.append(checkpoint)
+        cached = (
+            _read_embedding_checkpoint(checkpoint, len(batch))
+            if checkpoint is not None
+            else None
+        )
         if cached is not None:
             embeddings.extend(cached)
             continue
@@ -535,7 +555,11 @@ def _embed_nodes(
                 "than inputs",
             )
         embeddings.extend(batch_embeddings)
-        _write_embedding_checkpoint(checkpoint, batch_embeddings)
+        if checkpoint is not None:
+            try:
+                _write_embedding_checkpoint(checkpoint, batch_embeddings)
+            except (OSError, TypeError, ValueError):
+                logger.warning("Could not persist embedding checkpoint", exc_info=True)
 
     for node, emb in zip(nodes, embeddings, strict=True):
         node.embedding = emb
@@ -598,7 +622,6 @@ def update_llm_index(
     *,
     iter_wrapper: IterWrapper[Document] = identity,
     rebuild=False,
-    resume=False,
     document_ids: Iterable[int] | None = None,
 ) -> str:
     """Rebuild or incrementally update the LLM index.

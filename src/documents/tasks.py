@@ -750,7 +750,6 @@ def llmindex_index(
     *,
     iter_wrapper: IterWrapper[Document] = identity,
     rebuild: bool = False,
-    resume: bool = False,
     document_ids: list[int] | None = None,
 ) -> str | None:
     ai_config = AIConfig()
@@ -764,7 +763,6 @@ def llmindex_index(
         return update_llm_index(
             iter_wrapper=iter_wrapper,
             rebuild=rebuild,
-            resume=resume,
             document_ids=document_ids,
         )
     except EmbeddingRateLimitError as exc:
@@ -775,7 +773,6 @@ def llmindex_index(
             countdown=exc.retry_after,
             kwargs={
                 "rebuild": False,
-                "resume": True,
                 # A scoped request may have been promoted to a full rebuild
                 # because the stored embedding model changed. Resume the
                 # complete index in that case, while existing rows are still

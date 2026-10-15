@@ -42,6 +42,19 @@ def test_embedding_retry_rejects_permanent_error_with_retry_after() -> None:
     assert indexing._embedding_retry_delay(error) is None
 
 
+@pytest.mark.parametrize("retry_after", ["NaN", "Infinity", "-5"])
+def test_embedding_retry_uses_safe_delay_for_malformed_retry_after(
+    retry_after: str,
+) -> None:
+    class Response:
+        status_code = 429
+        headers = {"Retry-After": retry_after}
+
+    error = RuntimeError("rate limited")
+    error.response = Response()
+    assert indexing._embedding_retry_delay(error) == 1.0
+
+
 def test_embedding_retry_defers_long_window_without_sleeping(monkeypatch) -> None:
     class Node:
         embedding = None
@@ -347,8 +360,8 @@ def test_update_llm_index_rebuilds_on_model_name_change(
             return_value="model-b",
         ):
             # A deferred Celery retry must still detect a model change while
-            # it was waiting; resume never permits mixed-model vectors.
-            indexing.update_llm_index(rebuild=False, resume=True)
+            # it was waiting; the stored model identity prevents mixing.
+            indexing.update_llm_index(rebuild=False)
 
     with indexing.get_vector_store() as store:
         # Schema metadata only updates when the table is dropped and recreated, never
@@ -392,13 +405,11 @@ def test_scoped_model_rebuild_resumes_all_documents_after_rate_limit(
         with pytest.raises(indexing.EmbeddingRateLimitError) as raised:
             indexing.update_llm_index(
                 rebuild=False,
-                resume=True,
                 document_ids=[documents[0].pk],
             )
         assert raised.value.full_rebuild is True
         indexing.update_llm_index(
             rebuild=False,
-            resume=True,
             document_ids=None,
         )
 
