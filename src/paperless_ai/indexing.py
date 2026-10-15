@@ -363,6 +363,12 @@ def get_rag_prompt_helper(
 _RETRY_AFTER_RE = re.compile(r"retry-after(?:-ms)?\D+(\d+)", re.IGNORECASE)
 _EMBEDDING_CHECKPOINT_TTL = timedelta(days=7)
 _EMBEDDING_CHECKPOINT_CLEANUP_INTERVAL = timedelta(hours=1)
+# The Paperless embedding key is capped at 10 RPM and the site partition at
+# 24,000 TPM.  Stay below the key limit and account for request payloads
+# locally so a document with many chunks cannot burst the shared gateway.
+_EMBEDDING_MIN_INTERVAL_SECONDS = 7.5
+_EMBEDDING_TPM_LIMIT = 24_000
+_EMBEDDING_TPM_WINDOW_SECONDS = 60.0
 
 
 def _embedding_retry_delay(exc: Exception) -> float | None:
@@ -402,6 +408,65 @@ def _embedding_retry_delay(exc: Exception) -> float | None:
             value /= 1000
         return max(1.0, value)
     return 1.0
+
+
+def _embedding_pacing_path(model_name: str) -> Path:
+    checkpoint_dir = Path(settings.DATA_DIR) / "embedding-checkpoints"
+    checkpoint_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    digest = hashlib.sha256(model_name.encode()).hexdigest()
+    return checkpoint_dir / f".{digest}.pacing.json"
+
+
+def _write_embedding_pacing(path: Path, value: dict[str, object]) -> None:
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(value, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        Path(temporary).replace(path)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def _reserve_embedding_capacity(model_name: str, texts: list[str]) -> None:
+    """Reserve one provider request or defer without sleeping under a DB lock."""
+    path = _embedding_pacing_path(model_name)
+    lock = FileLock(str(path) + ".lock")
+    try:
+        with lock.acquire(timeout=0):
+            now = time.time()
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, ValueError):
+                state = {}
+            events = []
+            for event in state.get("events", []):
+                try:
+                    timestamp = float(event[0])
+                    tokens = int(event[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if math.isfinite(timestamp) and tokens > 0 and now - timestamp < _EMBEDDING_TPM_WINDOW_SECONDS:
+                    events.append([timestamp, tokens])
+            request_tokens = max(1, math.ceil(sum(len(text) for text in texts) / 4))
+            wait = max(0.0, _EMBEDDING_MIN_INTERVAL_SECONDS - (now - float(state.get("last_request", 0))))
+            used_tokens = sum(event[1] for event in events)
+            if used_tokens + request_tokens > _EMBEDDING_TPM_LIMIT and events:
+                wait = max(wait, _EMBEDDING_TPM_WINDOW_SECONDS - (now - events[0][0]))
+            if wait > 0:
+                raise EmbeddingRateLimitError(wait)
+            events.append([now, request_tokens])
+            _write_embedding_pacing(path, {"last_request": now, "events": events})
+    except Timeout as exc:
+        # Another worker owns the reservation.  A short defer lets it finish
+        # without sleeping while the vector-store write lock is held.
+        raise EmbeddingRateLimitError(1.0) from exc
 
 
 def _embedding_checkpoint_path(model_name: str, batch: list[str]) -> Path:
@@ -539,6 +604,7 @@ def _embed_nodes(
         if cached is not None:
             embeddings.extend(cached)
             continue
+        _reserve_embedding_capacity(model_name, batch)
         try:
             batch_embeddings = embed_model.get_text_embedding_batch(batch)
         except Exception as exc:
