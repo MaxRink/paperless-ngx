@@ -405,7 +405,7 @@ def _embedding_retry_delay(exc: Exception) -> float | None:
 
 
 def _embedding_checkpoint_path(model_name: str, batch: list[str]) -> Path:
-    checkpoint_dir = Path(settings.SCRATCH_DIR) / "embedding-checkpoints"
+    checkpoint_dir = Path(settings.DATA_DIR) / "embedding-checkpoints"
     checkpoint_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     digest = hashlib.sha256(
         json.dumps([model_name, batch], ensure_ascii=False).encode(),
@@ -510,7 +510,7 @@ def _embed_nodes(
         "model_name",
         type(embed_model).__name__,
     )
-    checkpoint_dir = Path(settings.SCRATCH_DIR) / "embedding-checkpoints"
+    checkpoint_dir = Path(settings.DATA_DIR) / "embedding-checkpoints"
     try:
         checkpoint_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         _prune_embedding_checkpoints(checkpoint_dir)

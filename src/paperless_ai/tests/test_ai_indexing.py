@@ -184,7 +184,7 @@ def test_real_celery_task_stops_after_three_provider_attempts() -> None:
 
 
 def test_embedding_checkpoint_resumes_after_provider_window(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(settings, "SCRATCH_DIR", tmp_path)
+    monkeypatch.setattr(settings, "DATA_DIR", tmp_path)
 
     class Node:
         def __init__(self, text: str) -> None:
