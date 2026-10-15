@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 import pytest_mock
+from celery.exceptions import Retry
 from django.conf import settings
 from django.db import connection
 from django.test import override_settings
@@ -146,6 +147,40 @@ def test_embedding_task_uses_short_wakeups_without_calling_provider(
         "provider_attempts": 1,
         "not_before": 7_300.0,
     }
+
+
+def test_real_celery_task_allows_cooldown_wakeups_past_default_retry_limit(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(document_tasks.time, "time", lambda: 100.0)
+    with patch("paperless_ai.indexing.update_llm_index") as update:
+        task = document_tasks.llmindex_index
+        with task.push_request(retries=4):
+            with pytest.raises(Retry) as raised:
+                task.run(
+                    task,
+                    rebuild=False,
+                    document_ids=[7],
+                    provider_attempts=1,
+                    not_before=7_300.0,
+                )
+    update.assert_not_called()
+    assert raised.value.when == 300
+    assert task.max_retries is None
+
+
+def test_real_celery_task_stops_after_three_provider_attempts() -> None:
+    error = EmbeddingRateLimitError(900)
+    with patch(
+        "paperless_ai.indexing.update_llm_index",
+        side_effect=error,
+    ) as update:
+        task = document_tasks.llmindex_index
+        with task.push_request(retries=4):
+            with pytest.raises(EmbeddingRateLimitError) as raised:
+                task.run(task, provider_attempts=2)
+    update.assert_called_once()
+    assert raised.value is error
 
 
 def test_embedding_checkpoint_resumes_after_provider_window(tmp_path, monkeypatch) -> None:

@@ -398,6 +398,24 @@ class TestAIIndex(DirectoriesMixin, TestCase):
             tasks.update_document_in_llm_index(doc.pk)
             llm_index_add_or_update_document.assert_called_once_with(doc)
 
+    def test_update_document_in_llm_index_legacy_message_reloads_document(self) -> None:
+        doc = Document.objects.create(
+            title="old title",
+            content="my document",
+            checksum="fresh-state",
+        )
+        doc.title = "new title"
+        doc.save(update_fields=["title"])
+        with mock.patch(
+            "documents.tasks.llm_index_add_or_update_document",
+        ) as update:
+            tasks.update_document_in_llm_index.run(
+                tasks.update_document_in_llm_index,
+                document=doc,
+            )
+        update.assert_called_once()
+        assert update.call_args.args[0].title == "new title"
+
     def test_remove_document_from_llm_index(self) -> None:
         """
         GIVEN:
