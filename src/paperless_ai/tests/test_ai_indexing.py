@@ -1,10 +1,12 @@
 import logging
+import pickle
 from pathlib import Path
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
 import pytest_mock
+from django.conf import settings
 from django.db import connection
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
@@ -23,10 +25,108 @@ from documents.signals import document_consumption_finished
 from documents.signals import document_updated
 from paperless.models import ApplicationConfiguration
 from paperless_ai import indexing
+from paperless_ai.exceptions import EmbeddingRateLimitError
 from paperless_ai.tests.conftest import FakeEmbedding
 from paperless_ai.vector_store import PaperlessSqliteVecVectorStore
 from paperless_testing.factories import DocumentFactory
 from paperless_testing.factories import PaperlessTaskFactory
+
+
+def test_embedding_retry_rejects_permanent_error_with_retry_after() -> None:
+    class Response:
+        status_code = 401
+        headers = {"Retry-After": "900"}
+
+    error = RuntimeError("unauthorized")
+    error.response = Response()
+    assert indexing._embedding_retry_delay(error) is None
+
+
+def test_embedding_retry_defers_long_window_without_sleeping(monkeypatch) -> None:
+    class Node:
+        embedding = None
+
+        def get_content(self, metadata_mode):
+            return "text"
+
+    class Model:
+        def get_text_embedding_batch(self, texts):
+            error = RuntimeError("429 retry-after: 900")
+            error.status_code = 429
+            raise error
+
+    slept = []
+    monkeypatch.setattr(indexing.time, "sleep", slept.append)
+    with pytest.raises(indexing.EmbeddingRateLimitError) as raised:
+        indexing._embed_nodes([Node()], Model())
+    assert raised.value.retry_after == 900
+    assert slept == []
+
+
+def test_embedding_rate_limit_error_round_trips_through_celery_pickle() -> None:
+    original = EmbeddingRateLimitError(900)
+    restored = pickle.loads(pickle.dumps(original))
+    assert restored.retry_after == 900
+    assert str(restored) == "Embedding provider requested retry after 900s"
+
+
+def test_empty_embedding_batch_does_not_call_provider() -> None:
+    class Model:
+        def get_text_embedding_batch(self, texts):
+            raise AssertionError("empty batches must not reach the provider")
+
+    indexing._embed_nodes([], Model())
+
+
+def test_embedding_checkpoint_write_cleans_temporary_file_on_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    checkpoint = tmp_path / "checkpoint.json"
+
+    def fail_dump(*args, **kwargs):
+        raise RuntimeError("simulated checkpoint write failure")
+
+    monkeypatch.setattr(indexing.json, "dump", fail_dump)
+    with pytest.raises(RuntimeError, match="simulated checkpoint"):
+        indexing._write_embedding_checkpoint(checkpoint, [[1.0, 2.0]])
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_embedding_checkpoint_resumes_after_provider_window(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "SCRATCH_DIR", tmp_path)
+
+    class Node:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.embedding = None
+
+        def get_content(self, metadata_mode):
+            return self.text
+
+    class Model:
+        embed_batch_size = 1
+
+        def __init__(self, fail_after: int | None = None) -> None:
+            self.calls = []
+            self.fail_after = fail_after
+
+        def get_text_embedding_batch(self, texts):
+            self.calls.extend(texts)
+            if self.fail_after is not None and len(self.calls) > self.fail_after:
+                error = RuntimeError("429 retry-after: 900")
+                error.status_code = 429
+                raise error
+            return [[len(text)] for text in texts]
+
+    nodes = [Node("a"), Node("bb"), Node("ccc"), Node("dddd")]
+    with pytest.raises(EmbeddingRateLimitError):
+        indexing._embed_nodes(nodes, Model(fail_after=2), model_name="model-a")
+
+    retry = Model()
+    indexing._embed_nodes(nodes, retry, model_name="model-a")
+    assert retry.calls == ["ccc", "dddd"]
+    assert [node.embedding for node in nodes] == [[1], [2], [3], [4]]
 
 
 @pytest.fixture
@@ -246,12 +346,65 @@ def test_update_llm_index_rebuilds_on_model_name_change(
             "paperless_ai.indexing.get_configured_model_name",
             return_value="model-b",
         ):
-            indexing.update_llm_index(rebuild=False)
+            # A deferred Celery retry must still detect a model change while
+            # it was waiting; resume never permits mixed-model vectors.
+            indexing.update_llm_index(rebuild=False, resume=True)
 
     with indexing.get_vector_store() as store:
         # Schema metadata only updates when the table is dropped and recreated, never
         # on incremental writes - so "model-b" here proves a full rebuild happened.
         assert store.stored_model_name() == "model-b"
+
+
+@pytest.mark.django_db
+def test_scoped_model_rebuild_resumes_all_documents_after_rate_limit(
+    temp_llm_index_dir: Path,
+    mock_embed_model: FakeEmbedding,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    documents = [
+        DocumentFactory(content=f"document {index}") for index in range(3)
+    ]
+    original_embed_nodes = indexing._embed_nodes
+    model_b_calls = 0
+    fail_once = True
+
+    def embed_nodes(nodes, embed_model, *, model_name=None):
+        nonlocal model_b_calls, fail_once
+        if model_name == "model-b" and fail_once and model_b_calls >= 1:
+            fail_once = False
+            raise indexing.EmbeddingRateLimitError(900)
+        if model_name == "model-b":
+            model_b_calls += 1
+        return original_embed_nodes(nodes, embed_model, model_name=model_name)
+
+    monkeypatch.setattr(indexing, "_embed_nodes", embed_nodes)
+    with patch(
+        "paperless_ai.indexing.get_configured_model_name",
+        return_value="model-a",
+    ):
+        indexing.update_llm_index(rebuild=True)
+
+    with patch(
+        "paperless_ai.indexing.get_configured_model_name",
+        return_value="model-b",
+    ):
+        with pytest.raises(indexing.EmbeddingRateLimitError) as raised:
+            indexing.update_llm_index(
+                rebuild=False,
+                resume=True,
+                document_ids=[documents[0].pk],
+            )
+        assert raised.value.full_rebuild is True
+        indexing.update_llm_index(
+            rebuild=False,
+            resume=True,
+            document_ids=None,
+        )
+
+    with indexing.get_vector_store() as store:
+        assert store.stored_model_name() == "model-b"
+        assert set(store.get_modified_times()) == {str(doc.pk) for doc in documents}
 
 
 @pytest.mark.django_db

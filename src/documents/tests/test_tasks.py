@@ -340,7 +340,7 @@ class TestUpdateContent(DirectoriesMixin, TestCase):
         )
 
     @override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")
-    @mock.patch("documents.tasks.llm_index_add_or_update_document")
+    @mock.patch("documents.tasks.update_document_in_llm_index")
     @mock.patch("documents.search.get_backend")
     def test_update_content_version_updates_llm_index(
         self,
@@ -360,7 +360,9 @@ class TestUpdateContent(DirectoriesMixin, TestCase):
 
         tasks.update_document_content_maybe_archive_file(version.pk)
 
-        mock_llm_index.assert_called_once()
+        mock_llm_index.apply_async.assert_called_once_with(
+            kwargs={"document": version},
+        )
 
 
 class TestUpdateContentRemoteOCR(DirectoriesMixin, TestCase):
@@ -497,8 +499,8 @@ class TestAIIndex(DirectoriesMixin, TestCase):
     def test_bulk_update_does_not_enqueue_per_doc_llm_tasks(self) -> None:
         """bulk_update_documents must not enqueue a per-document LLM task for each document.
 
-        The bulk path calls update_llm_index once at the end; per-doc tasks would
-        be redundant work amplification.
+        The bulk path enqueues one scoped index task; per-doc tasks would be
+        redundant work amplification.
         """
         docs = [
             Document.objects.create(
@@ -512,16 +514,13 @@ class TestAIIndex(DirectoriesMixin, TestCase):
             mock.patch(
                 "documents.tasks.update_document_in_llm_index",
             ) as update_document_in_llm_index,
-            mock.patch(
-                "documents.tasks.update_llm_index",
-            ) as update_llm_index,
+            mock.patch("documents.tasks.llmindex_index") as llmindex_index,
         ):
             doc_ids = [doc.pk for doc in docs]
             tasks.bulk_update_documents(doc_ids)
             self.assertEqual(update_document_in_llm_index.apply_async.call_count, 0)
-            update_llm_index.assert_called_once_with(
-                rebuild=False,
-                document_ids=doc_ids,
+            llmindex_index.apply_async.assert_called_once_with(
+                kwargs={"rebuild": False, "document_ids": doc_ids},
             )
 
 
