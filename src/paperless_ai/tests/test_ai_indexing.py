@@ -56,6 +56,11 @@ def test_embedding_retry_uses_safe_delay_for_malformed_retry_after(
     assert indexing._embedding_retry_delay(error) == 1.0
 
 
+def test_embedding_retry_uses_safe_delay_for_overflowing_message_delay() -> None:
+    error = RuntimeError("429 retry-after: " + "9" * 500)
+    assert indexing._embedding_retry_delay(error) == 1.0
+
+
 def test_embedding_retry_defers_long_window_without_sleeping(monkeypatch) -> None:
     class Node:
         embedding = None

@@ -396,6 +396,8 @@ def _embedding_retry_delay(exc: Exception) -> float | None:
     match = _RETRY_AFTER_RE.search(str(exc))
     if match:
         value = float(match.group(1))
+        if not math.isfinite(value):
+            return 1.0
         if "-ms" in match.group(0).lower():
             value /= 1000
         return max(1.0, value)
