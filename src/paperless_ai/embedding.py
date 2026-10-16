@@ -48,6 +48,8 @@ def get_embedding_model(config: AIConfig) -> "BaseEmbedding":
                 timeout=config.llm_request_timeout,
                 http_client=http_client,
                 async_http_client=async_http_client,
+                # Paperless owns retry/defer decisions for metered embedding calls.
+                max_retries=0,
             )
         case LLMEmbeddingBackend.HUGGINGFACE:
             from llama_index.embeddings.huggingface import HuggingFaceEmbedding
@@ -135,6 +137,6 @@ def build_llm_index_text(doc: Document) -> str:
         lines.append(f"Custom Field - {instance.field.name}: {instance}")
 
     lines.append("\nContent:\n")
-    lines.append(doc.content or "")
+    lines.append(doc.get_effective_content() or "")
 
     return _normalize_llm_index_text("\n".join(lines))

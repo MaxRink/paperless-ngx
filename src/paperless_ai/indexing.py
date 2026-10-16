@@ -1,8 +1,18 @@
 import enum
+import hashlib
+import json
 import logging
+import math
+import os
+import re
+import tempfile
+import time
 from collections.abc import Iterable
 from contextlib import contextmanager
+from datetime import datetime
 from datetime import timedelta
+from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from django.conf import settings
@@ -17,11 +27,14 @@ from documents.models import PaperlessTask
 from documents.utils import IterWrapper
 from documents.utils import QuerySetStream
 from documents.utils import identity
+from documents.versioning import annotate_effective_content
+from documents.versioning import root_document_ids
 from paperless.config import AIConfig
 from paperless_ai.db import db_connection_released
 from paperless_ai.embedding import build_llm_index_text
 from paperless_ai.embedding import get_configured_model_name
 from paperless_ai.embedding import get_embedding_model
+from paperless_ai.exceptions import EmbeddingRateLimitError
 
 if TYPE_CHECKING:
     from llama_index.core.schema import BaseNode
@@ -349,17 +362,214 @@ def get_rag_prompt_helper(
     )
 
 
-def _embed_nodes(nodes: list["BaseNode"], embed_model) -> None:
+_RETRY_AFTER_RE = re.compile(r"retry-after(?:-ms)?\D+(\d+)", re.IGNORECASE)
+_EMBEDDING_CHECKPOINT_TTL = timedelta(days=7)
+_EMBEDDING_CHECKPOINT_CLEANUP_INTERVAL = timedelta(hours=1)
+
+
+def _embedding_retry_delay(exc: Exception) -> float | None:
+    """Return the provider's transient retry delay, if any."""
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if status is None and response is not None:
+        status = getattr(response, "status_code", None)
+    if status is None:
+        match = re.search(r"\b(429|502|503|504)\b", str(exc))
+        status = int(match.group(1)) if match else None
+    if status not in (429, 502, 503, 504):
+        return None
+    if headers:
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+        if raw:
+            try:
+                value = float(raw)
+                if not math.isfinite(value):
+                    raise ValueError
+                return max(1.0, value)
+            except (TypeError, ValueError):
+                try:
+                    return max(
+                        1.0,
+                        parsedate_to_datetime(raw).timestamp() - time.time(),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    pass
+    match = _RETRY_AFTER_RE.search(str(exc))
+    if match:
+        value = float(match.group(1))
+        if not math.isfinite(value):
+            return 1.0
+        if "-ms" in match.group(0).lower():
+            value /= 1000
+        return max(1.0, value)
+    return 1.0
+
+
+def _embedding_checkpoint_path(model_name: str, batch: list[str]) -> Path:
+    checkpoint_dir = Path(settings.DATA_DIR) / "embedding-checkpoints"
+    checkpoint_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    digest = hashlib.sha256(
+        json.dumps([model_name, batch], ensure_ascii=False).encode(),
+    ).hexdigest()
+    return checkpoint_dir / f"{digest}.json"
+
+
+def _read_embedding_checkpoint(
+    path: Path,
+    expected: int,
+) -> list[list[float]] | None:
+    try:
+        values = json.loads(path.read_text())
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    if (
+        not isinstance(values, list)
+        or len(values) != expected
+        or not all(isinstance(value, list) for value in values)
+    ):
+        return None
+    if not values or not values[0]:
+        return None
+    dimension = len(values[0])
+    if any(
+        len(value) != dimension
+        or any(
+            not isinstance(component, (int, float))
+            or not math.isfinite(component)
+            for component in value
+        )
+        for value in values
+    ):
+        return None
+    return values
+
+
+def _write_embedding_checkpoint(path: Path, values: list[list[float]]) -> None:
+    fd, temporary = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        os.fchmod(fd, 0o600)
+        handle = os.fdopen(fd, "w")
+        fd = -1  # ownership transferred to handle
+        with handle:
+            json.dump(values, handle, separators=(",", ":"))
+        Path(temporary).replace(path)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            Path(temporary).unlink(missing_ok=True)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _prune_embedding_checkpoints(checkpoint_dir: Path) -> None:
+    marker = checkpoint_dir / ".cleanup"
+    now = timezone.now()
+    try:
+        if now - datetime.fromtimestamp(
+            marker.stat().st_mtime,
+            tz=timezone.get_current_timezone(),
+        ) < _EMBEDDING_CHECKPOINT_CLEANUP_INTERVAL:
+            return
+    except FileNotFoundError:
+        pass
+    marker.touch(mode=0o600, exist_ok=True)
+    cutoff = now - _EMBEDDING_CHECKPOINT_TTL
+    for checkpoint in checkpoint_dir.glob("*.json"):
+        try:
+            modified = datetime.fromtimestamp(
+                checkpoint.stat().st_mtime,
+                tz=timezone.get_current_timezone(),
+            )
+            if modified < cutoff:
+                checkpoint.unlink()
+        except FileNotFoundError:
+            continue
+
+
+def _embed_nodes(
+    nodes: list["BaseNode"],
+    embed_model,
+    *,
+    model_name: str | None = None,
+) -> None:
     """Embed ``nodes`` in place using ``embed_model``."""
+    if not nodes:
+        return
     from llama_index.core.schema import MetadataMode
 
     texts = [n.get_content(metadata_mode=MetadataMode.EMBED) for n in nodes]
-    for node, emb in zip(
-        nodes,
-        embed_model.get_text_embedding_batch(texts),
-        strict=True,
-    ):
+    batch_size = getattr(embed_model, "embed_batch_size", None) or len(texts)
+    embeddings = []
+    model_name = model_name or getattr(
+        embed_model,
+        "model_name",
+        type(embed_model).__name__,
+    )
+    checkpoint_dir = Path(settings.DATA_DIR) / "embedding-checkpoints"
+    try:
+        checkpoint_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _prune_embedding_checkpoints(checkpoint_dir)
+    except OSError:
+        # Checkpointing is an optimization. A read-only or unavailable
+        # scratch directory must not turn a successful provider response into
+        # a failed embedding task.
+        checkpoint_dir = None
+    checkpoint_paths = []
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start : start + batch_size]
+        if checkpoint_dir is not None:
+            try:
+                checkpoint = _embedding_checkpoint_path(model_name, batch)
+            except OSError:
+                checkpoint = None
+        else:
+            checkpoint = None
+        if checkpoint is not None:
+            checkpoint_paths.append(checkpoint)
+        cached = (
+            _read_embedding_checkpoint(checkpoint, len(batch))
+            if checkpoint is not None
+            else None
+        )
+        if cached is not None:
+            embeddings.extend(cached)
+            continue
+        try:
+            batch_embeddings = embed_model.get_text_embedding_batch(batch)
+        except Exception as exc:
+            delay = _embedding_retry_delay(exc)
+            if delay is None:
+                raise
+            # Never sleep while the caller holds the vector-store write lock.
+            # The Celery owner defers the whole embedding task for the exact
+            # provider window, and completed documents remain persisted.
+            raise EmbeddingRateLimitError(delay) from exc
+        if len(batch_embeddings) != len(batch):
+            raise ValueError(
+                "Embedding provider returned a different number of vectors "
+                "than inputs",
+            )
+        embeddings.extend(batch_embeddings)
+        if checkpoint is not None:
+            try:
+                _write_embedding_checkpoint(checkpoint, batch_embeddings)
+            except (OSError, TypeError, ValueError):
+                logger.warning("Could not persist embedding checkpoint", exc_info=True)
+
+    for node, emb in zip(nodes, embeddings, strict=True):
         node.embedding = emb
+    for checkpoint in checkpoint_paths:
+        try:
+            checkpoint.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove embedding checkpoint", exc_info=True)
 
 
 def document_id_filters(doc_ids):
@@ -443,11 +653,11 @@ def update_llm_index(
                 "Skipping LLM index update: migration check deferred; "
                 "will retry next run."
             )
-    documents = Document.objects.select_related(
-        "correspondent",
-        "document_type",
-        "storage_path",
-    ).prefetch_related("tags", "notes", "custom_fields__field")
+    documents = annotate_effective_content(
+        Document.objects.filter(root_document__isnull=True)
+        .select_related("correspondent", "document_type", "storage_path")
+        .prefetch_related("tags", "notes", "custom_fields__field"),
+    )
     no_documents = not documents.exists()
 
     # Fast exit before touching config: nothing to index and no existing index.
@@ -458,6 +668,8 @@ def update_llm_index(
     config = AIConfig()
     model_name = get_configured_model_name(config)
 
+    # A deferred retry must still verify the stored model identity. Never mix
+    # vectors if configuration changes while a provider window is pending.
     if not rebuild:
         with read_store() as store:
             if store.table_exists() and store.config_mismatch(model_name):
@@ -478,12 +690,19 @@ def update_llm_index(
                 QuerySetStream(documents, chunk_size=_INDEX_STREAM_CHUNK_SIZE),
             ):
                 nodes = build_document_node(document, chunk_size=chunk_size)
-                _embed_nodes(nodes, embed_model)
+                try:
+                    _embed_nodes(nodes, embed_model, model_name=model_name)
+                except EmbeddingRateLimitError as exc:
+                    # A scoped request can have been promoted to a full
+                    # rebuild by model/migration checks. Tell the Celery
+                    # owner to resume the whole rebuild after the wait.
+                    exc.full_rebuild = True
+                    raise
                 store.add(nodes)
             msg = "LLM index rebuilt successfully."
         else:
             scoped_documents = (
-                documents.filter(id__in=document_ids)
+                documents.filter(id__in=root_document_ids(document_ids))
                 if document_ids is not None
                 else documents
             )
@@ -496,7 +715,11 @@ def update_llm_index(
                 if existing.get(doc_id) == document.modified.isoformat():
                     continue
                 nodes = build_document_node(document, chunk_size=chunk_size)
-                _embed_nodes(nodes, embed_model)
+                try:
+                    _embed_nodes(nodes, embed_model, model_name=model_name)
+                except EmbeddingRateLimitError as exc:
+                    exc.full_rebuild = False
+                    raise
                 store.upsert_document(doc_id, nodes)
                 changed += 1
             msg = (
@@ -510,14 +733,23 @@ def update_llm_index(
 
 
 def llm_index_add_or_update_document(document: Document):
-    """Add or atomically replace a document's chunks in the index."""
+    """
+    Add or atomically replace a document's chunks in the index. Only root
+    documents are indexed, so a version is indexed as its root document.
+    """
+    if document.root_document_id is not None:
+        document = document.root_document
     config = AIConfig()
     new_nodes = build_document_node(
         document,
         chunk_size=config.llm_embedding_chunk_size,
     )
     if new_nodes:
-        _embed_nodes(new_nodes, get_embedding_model(config))
+        _embed_nodes(
+            new_nodes,
+            get_embedding_model(config),
+            model_name=get_configured_model_name(config),
+        )
 
     with write_store(embed_model_name=get_configured_model_name(config)) as store:
         migration_result = _check_and_run_migrations(store)
@@ -688,7 +920,7 @@ def retrieve_similar_nodes(
     )
 
     query_text = truncate_embedding_query(
-        (document.title or "") + "\n" + (document.content or ""),
+        (document.title or "") + "\n" + (document.get_effective_content() or ""),
         chunk_size=config.llm_embedding_chunk_size,
     )
     # Hold the shared read lock for the whole retrieval so the connection is
