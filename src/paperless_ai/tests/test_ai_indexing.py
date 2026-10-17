@@ -158,6 +158,74 @@ def test_metered_checkpoint_retry_only_reembeds_remaining_batches(
     assert [node.embedding for node in nodes] == [[1.0], [3.0], [4.0]]
 
 
+@pytest.mark.parametrize(
+    ("module", "model_name", "allowlist", "expected"),
+    [
+        ("llama_index.embeddings.openai_like", "qwen-local", "qwen-local", False),
+        (
+            "llama_index.embeddings.openai_like",
+            "gemini-embedding-001",
+            "qwen-local",
+            True,
+        ),
+        ("llama_index.embeddings.openai_like", "gemini-embedding-001", None, True),
+        ("llama_index.embeddings.openai_like", None, "qwen-local", True),
+        ("llama_index.embeddings.openai_like", "gemini-embedding-001", " , , ", True),
+        ("llama_index.embeddings.ollama", "qwen-local", "qwen-local", False),
+        ("llama_index.embeddings.huggingface", "qwen-local", "qwen-local", False),
+    ],
+)
+def test_embedding_pacing_allowlist_is_exact_and_openai_only(
+    monkeypatch,
+    module: str,
+    model_name: str | None,
+    allowlist: str | None,
+    expected: bool,
+) -> None:
+    if allowlist is None:
+        monkeypatch.delenv("PAPERLESS_AI_UNMETERED_EMBEDDING_MODELS", raising=False)
+    else:
+        monkeypatch.setenv("PAPERLESS_AI_UNMETERED_EMBEDDING_MODELS", allowlist)
+    attrs = {"__module__": module}
+    if model_name is not None:
+        attrs["model_name"] = model_name
+    embed_model = type("FakeEmbedding", (), attrs)()
+
+    assert indexing._embedding_requires_pacing(embed_model) is expected
+
+
+def test_embed_nodes_uses_configured_alias_for_local_openai_compatible_model(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("PAPERLESS_AI_UNMETERED_EMBEDDING_MODELS", "qwen-local")
+
+    class Node:
+        embedding = None
+
+        def get_content(self, *, metadata_mode) -> str:
+            return "x" * (indexing._EMBEDDING_TPM_LIMIT * 3 + 1)
+
+    class OpenAILikeFake:
+        __module__ = "llama_index.embeddings.openai_like"
+        model_name = "gemini-embedding-001"
+        embed_batch_size = 1
+
+        def get_text_embedding_batch(self, texts: list[str]) -> list[list[float]]:
+            return [[0.1] for _ in texts]
+
+    model = OpenAILikeFake()
+    nodes = [Node()]
+    with (
+        patch.object(indexing.settings, "DATA_DIR", tmp_path),
+        patch("paperless_ai.indexing._reserve_embedding_capacity") as reserve,
+    ):
+        indexing._embed_nodes(nodes, model, model_name="qwen-local")
+
+    reserve.assert_not_called()
+    assert nodes[0].embedding == [0.1]
+
+
 @pytest.fixture
 def real_document(db: None) -> Document:
     return Document.objects.create(
