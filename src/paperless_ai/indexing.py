@@ -400,6 +400,12 @@ def _write_embedding_pacing(path: Path, value: dict[str, object]) -> None:
 
 def _reserve_embedding_capacity(model_name: str, texts: list[str]) -> None:
     """Reserve a provider request or defer without sleeping under the DB lock."""
+    request_tokens = _estimate_embedding_tokens(texts)
+    if request_tokens > _EMBEDDING_TPM_LIMIT:
+        raise ValueError(
+            "A single embedding batch exceeds the metered provider token limit; "
+            "reduce the configured chunk size before indexing",
+        )
     path = _embedding_pacing_path(model_name)
     lock = FileLock(str(path) + ".lock")
     try:
@@ -424,12 +430,6 @@ def _reserve_embedding_capacity(model_name: str, texts: list[str]) -> None:
                     and now - timestamp < _EMBEDDING_TPM_WINDOW_SECONDS
                 ):
                     events.append([timestamp, tokens])
-            request_tokens = max(
-                1,
-                math.ceil(sum(len(text.encode("utf-8")) for text in texts) / 3),
-            )
-            if request_tokens > _EMBEDDING_TPM_LIMIT:
-                raise EmbeddingRateLimitError(_EMBEDDING_TPM_WINDOW_SECONDS)
             try:
                 last_request = float(state.get("last_request", 0))
             except (TypeError, ValueError):
@@ -452,6 +452,51 @@ def _reserve_embedding_capacity(model_name: str, texts: list[str]) -> None:
             _write_embedding_pacing(path, {"last_request": now, "events": events})
     except Timeout as exc:
         raise EmbeddingRateLimitError(1.0) from exc
+
+
+def _estimate_embedding_tokens(texts: list[str]) -> int:
+    """Estimate provider tokens using the same conservative pacing formula."""
+    return max(1, math.ceil(sum(len(text.encode("utf-8")) for text in texts) / 3))
+
+
+def _embedding_batch_slices(
+    texts: list[str],
+    batch_size: int,
+    *,
+    metered: bool,
+) -> Iterable[list[str]]:
+    """Yield deterministic provider batches within the metered token limit.
+
+    Local embedding backends retain their configured batch size. Metered
+    OpenAI-compatible backends additionally split batches before the pacing
+    reservation so a large document cannot be deferred forever as an
+    impossible request.
+    """
+    batch_size = max(1, batch_size)
+    if not metered:
+        for start in range(0, len(texts), batch_size):
+            yield texts[start : start + batch_size]
+        return
+
+    start = 0
+    while start < len(texts):
+        end = min(start + batch_size, len(texts))
+        batch: list[str] = []
+        tokens = 0
+        while start + len(batch) < end:
+            text = texts[start + len(batch)]
+            text_tokens = _estimate_embedding_tokens([text])
+            if text_tokens > _EMBEDDING_TPM_LIMIT:
+                raise ValueError(
+                    "A single embedding chunk exceeds the metered provider token "
+                    "limit; reduce the configured chunk size before indexing",
+                )
+            if batch and tokens + text_tokens > _EMBEDDING_TPM_LIMIT:
+                break
+            batch.append(text)
+            tokens += text_tokens
+        yield batch
+        start += len(batch)
 
 
 def _embedding_requires_pacing(embed_model: object) -> bool:
@@ -624,8 +669,11 @@ def _embed_nodes(
         # a failed embedding task.
         checkpoint_dir = None
     checkpoint_paths = []
-    for start in range(0, len(texts), batch_size):
-        batch = texts[start : start + batch_size]
+    for batch in _embedding_batch_slices(
+        texts,
+        batch_size,
+        metered=_embedding_requires_pacing(embed_model),
+    ):
         if checkpoint_dir is not None:
             try:
                 checkpoint = _embedding_checkpoint_path(model_name, batch)
