@@ -885,7 +885,17 @@ def update_document_in_llm_index(
         document_id = document_id.pk
     if document_id is None:
         raise ValueError("document_id is required")
-    document = Document.objects.get(pk=document_id)
+    try:
+        document = Document.objects.get(pk=document_id)
+    except Document.DoesNotExist:
+        # A queued update can outlive the document transaction. Treat that
+        # race as a successful no-op instead of retrying a permanently
+        # impossible embedding request.
+        logger.info(
+            "Document %s no longer exists, skipping LLM index update",
+            document_id,
+        )
+        return
     if not_before is not None and time.time() < not_before:
         _defer_embedding_retry(
             self,

@@ -475,6 +475,15 @@ class TestAIIndex(DirectoriesMixin, TestCase):
             tasks.update_document_in_llm_index(doc)
             llm_index_add_or_update_document.assert_called_once_with(doc)
 
+    def test_update_document_in_llm_index_deleted_document_is_noop(self) -> None:
+        """A queued index update must tolerate deletion before task execution."""
+        with mock.patch(
+            "documents.tasks.llm_index_add_or_update_document",
+        ) as llm_index_add_or_update_document:
+            tasks.update_document_in_llm_index(999999)
+
+        llm_index_add_or_update_document.assert_not_called()
+
     def test_remove_document_from_llm_index(self) -> None:
         """
         GIVEN:
