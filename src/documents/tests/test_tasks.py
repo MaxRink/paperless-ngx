@@ -524,15 +524,17 @@ class TestAIIndex(DirectoriesMixin, TestCase):
                 "documents.tasks.update_document_in_llm_index",
             ) as update_document_in_llm_index,
             mock.patch(
-                "paperless_ai.indexing.update_llm_index",
-            ) as update_llm_index,
+                "documents.tasks.llmindex_index",
+            ) as llmindex_index,
         ):
             doc_ids = [doc.pk for doc in docs]
             tasks.bulk_update_documents(doc_ids)
             self.assertEqual(update_document_in_llm_index.apply_async.call_count, 0)
-            update_llm_index.assert_called_once_with(
-                rebuild=False,
-                document_ids=doc_ids,
+            llmindex_index.apply_async.assert_called_once_with(
+                kwargs={
+                    "rebuild": False,
+                    "document_ids": doc_ids,
+                },
             )
 
 
