@@ -454,6 +454,18 @@ def _reserve_embedding_capacity(model_name: str, texts: list[str]) -> None:
         raise EmbeddingRateLimitError(1.0) from exc
 
 
+def _embedding_requires_pacing(embed_model: object) -> bool:
+    """Return whether this backend is subject to remote provider quotas.
+
+    Local HuggingFace and Ollama embeddings have no upstream RPM/TPM quota;
+    pacing them only slows indexing and makes local rebuilds fail under the
+    deferred retry path. OpenAI-compatible embeddings are metered and keep
+    the cross-worker reservation.
+    """
+    module = type(embed_model).__module__.lower()
+    return "openai" in module
+
+
 def _embedding_retry_delay(exc: Exception) -> float | None:
     """Return the provider's transient retry delay, if any."""
     status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
@@ -629,7 +641,8 @@ def _embed_nodes(
             embeddings.extend(cached)
             continue
         try:
-            _reserve_embedding_capacity(model_name, batch)
+            if _embedding_requires_pacing(embed_model):
+                _reserve_embedding_capacity(model_name, batch)
             batch_embeddings = embed_model.get_text_embedding_batch(batch)
         except Exception as exc:
             delay = _embedding_retry_delay(exc)
