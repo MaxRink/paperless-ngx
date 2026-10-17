@@ -534,8 +534,7 @@ def _read_embedding_checkpoint(
     if any(
         len(value) != dimension
         or any(
-            not isinstance(component, (int, float))
-            or not math.isfinite(component)
+            not isinstance(component, (int, float)) or not math.isfinite(component)
             for component in value
         )
         for value in values
@@ -571,10 +570,14 @@ def _prune_embedding_checkpoints(checkpoint_dir: Path) -> None:
     marker = checkpoint_dir / ".cleanup"
     now = timezone.now()
     try:
-        if now - datetime.fromtimestamp(
-            marker.stat().st_mtime,
-            tz=timezone.get_current_timezone(),
-        ) < _EMBEDDING_CHECKPOINT_CLEANUP_INTERVAL:
+        if (
+            now
+            - datetime.fromtimestamp(
+                marker.stat().st_mtime,
+                tz=timezone.get_current_timezone(),
+            )
+            < _EMBEDDING_CHECKPOINT_CLEANUP_INTERVAL
+        ):
             return
     except FileNotFoundError:
         pass
@@ -654,8 +657,7 @@ def _embed_nodes(
             raise EmbeddingRateLimitError(delay) from exc
         if len(batch_embeddings) != len(batch):
             raise ValueError(
-                "Embedding provider returned a different number of vectors "
-                "than inputs",
+                "Embedding provider returned a different number of vectors than inputs",
             )
         embeddings.extend(batch_embeddings)
         if checkpoint is not None:

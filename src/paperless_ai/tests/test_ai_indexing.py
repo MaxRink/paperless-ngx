@@ -725,7 +725,7 @@ class TestDocumentUpdatedSignalTriggersLlmReindex:
         doc = DocumentFactory()
         document_updated.send(sender=object, document=doc)
 
-        mock_task.apply_async.assert_called_once_with(kwargs={"document": doc})
+        mock_task.apply_async.assert_called_once_with(kwargs={"document_id": doc.pk})
 
     @pytest.mark.django_db
     @override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")
