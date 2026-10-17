@@ -1,3 +1,4 @@
+import pickle
 from unittest.mock import ANY
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -12,6 +13,7 @@ from paperless_ai.embedding import _normalize_llm_index_text
 from paperless_ai.embedding import build_llm_index_text
 from paperless_ai.embedding import get_configured_model_name
 from paperless_ai.embedding import get_embedding_model
+from paperless_ai.exceptions import EmbeddingRateLimitError
 from paperless_testing.factories import DocumentFactory
 
 
@@ -84,6 +86,16 @@ def test_get_embedding_model_openai(mock_ai_config):
             max_retries=0,
         )
         assert model == MockOpenAIEmbedding.return_value
+
+
+def test_embedding_rate_limit_error_is_pickle_safe():
+    """Celery can deserialize the retry exception with its numeric ETA."""
+    error = EmbeddingRateLimitError(42.5)
+
+    restored = pickle.loads(pickle.dumps(error))
+
+    assert restored.retry_after == 42.5
+    assert str(restored) == "Embedding provider requested retry after 42.5s"
 
 
 def test_get_embedding_model_openai_falls_back_to_llm_api_key(mock_ai_config):
