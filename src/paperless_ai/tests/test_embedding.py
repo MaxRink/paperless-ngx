@@ -81,6 +81,7 @@ def test_get_embedding_model_openai(mock_ai_config):
             timeout=120,
             http_client=ANY,
             async_http_client=ANY,
+            max_retries=0,
         )
         assert model == MockOpenAIEmbedding.return_value
 
@@ -137,6 +138,7 @@ def test_get_embedding_model_openai_prefers_embedding_endpoint(mock_ai_config):
             timeout=120,
             http_client=ANY,
             async_http_client=ANY,
+            max_retries=0,
         )
         assert model == MockOpenAIEmbedding.return_value
 
