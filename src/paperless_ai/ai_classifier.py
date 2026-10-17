@@ -50,10 +50,11 @@ def _fulltext_similar_documents(
     similarity - cruder, but far better than no candidates at all.
     more_like_this_ids returns only a ranked ID list, no scores, so weight is
     synthesized from rank (descending from top_k) rather than claiming a
-    similarity magnitude that doesn't exist. An active superuser is
-    normalized to ``None`` (no filtering) before calling, since the backend's
-    permission filter has no superuser short-circuit of its own. ``user=None``
-    means the document is unowned, so results are limited to unowned documents
+    similarity magnitude that doesn't exist. An active superuser is normalized
+    to ``None`` (no filtering) before calling, since the backend's permission
+    filter has no
+    superuser short-circuit of its own. A literal ``user=None`` instead
+    represents an unowned caller, so results are limited to unowned documents
     rather than the whole library. Results are re-checked with
     permitted_document_ids() since Tantivy's indexed permission fields lag the
     DB via async reindexing and judge a version by its own owner.
