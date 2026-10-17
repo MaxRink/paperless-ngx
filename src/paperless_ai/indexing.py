@@ -499,16 +499,29 @@ def _embedding_batch_slices(
         start += len(batch)
 
 
-def _embedding_requires_pacing(embed_model: object) -> bool:
+def _embedding_requires_pacing(
+    embed_model: object,
+    model_name: str | None = None,
+) -> bool:
     """Return whether this backend is subject to remote provider quotas.
 
     Local HuggingFace and Ollama embeddings have no upstream RPM/TPM quota;
     pacing them only slows indexing and makes local rebuilds fail under the
-    deferred retry path. OpenAI-compatible embeddings are metered and keep
-    the cross-worker reservation.
+    deferred retry path. OpenAI-compatible embeddings are metered by default;
+    explicitly allowlisted local aliases bypass the cross-worker reservation.
     """
     module = type(embed_model).__module__.lower()
-    return "openai" in module
+    if "openai" not in module:
+        return False
+    model_name = model_name or getattr(embed_model, "model_name", "")
+    unmetered_models = {
+        alias.strip()
+        for alias in os.environ.get(
+            "PAPERLESS_AI_UNMETERED_EMBEDDING_MODELS", ""
+        ).split(",")
+        if alias.strip()
+    }
+    return model_name not in unmetered_models
 
 
 def _embedding_retry_delay(exc: Exception) -> float | None:
@@ -672,7 +685,7 @@ def _embed_nodes(
     for batch in _embedding_batch_slices(
         texts,
         batch_size,
-        metered=_embedding_requires_pacing(embed_model),
+        metered=_embedding_requires_pacing(embed_model, model_name),
     ):
         if checkpoint_dir is not None:
             try:
@@ -692,7 +705,7 @@ def _embed_nodes(
             embeddings.extend(cached)
             continue
         try:
-            if _embedding_requires_pacing(embed_model):
+            if _embedding_requires_pacing(embed_model, model_name):
                 _reserve_embedding_capacity(model_name, batch)
             batch_embeddings = embed_model.get_text_embedding_batch(batch)
         except Exception as exc:
