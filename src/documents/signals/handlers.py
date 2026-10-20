@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import datetime
+import datetime as dt
 import logging
 import shutil
 import traceback as _tb
@@ -1106,7 +1106,7 @@ def _extract_input_data(
             for k, v in vars(overrides).items():
                 if v is None or k.startswith("_"):
                     continue
-                if isinstance(v, datetime.date):
+                if isinstance(v, dt.date):
                     v = v.isoformat()
                 elif isinstance(v, Path):
                     v = str(v)

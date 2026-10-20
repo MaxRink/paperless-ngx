@@ -1,4 +1,4 @@
-import datetime
+import datetime as dt
 import logging
 import shutil
 import time
@@ -551,7 +551,7 @@ def empty_trash(doc_ids=None) -> None:
         if doc_ids is not None
         else Document.deleted_objects.filter(
             deleted_at__lt=timezone.localtime(timezone.now())
-            - datetime.timedelta(
+            - dt.timedelta(
                 days=settings.EMPTY_TRASH_DELAY,
             ),
         )
@@ -604,7 +604,7 @@ def check_scheduled_workflows() -> None:
             trigger: WorkflowTrigger
             for trigger in schedule_triggers:
                 documents = Document.objects.none()
-                offset_td = datetime.timedelta(days=trigger.schedule_offset_days)
+                offset_td = dt.timedelta(days=trigger.schedule_offset_days)
                 threshold = now - offset_td
                 logger.debug(
                     f"Trigger {trigger.id}: checking if (date + {offset_td}) <= now ({now})",
@@ -631,7 +631,7 @@ def check_scheduled_workflows() -> None:
 
                     case WorkflowTrigger.ScheduleDateField.CUSTOM_FIELD:
                         # cap earliest date to avoid massive scans
-                        earliest_date = now - datetime.timedelta(days=365)
+                        earliest_date = now - dt.timedelta(days=365)
                         if offset_td.days < -365:
                             logger.warning(
                                 f"Trigger {trigger.id} has large negative offset ({offset_td.days}), "
@@ -655,9 +655,9 @@ def check_scheduled_workflows() -> None:
                             if cfi.value_date
                             and (
                                 timezone.make_aware(
-                                    datetime.datetime.combine(
+                                    dt.dt.combine(
                                         cfi.value_date,
-                                        datetime.time.min,
+                                        dt.time.min,
                                     ),
                                 )
                                 + offset_td
@@ -698,7 +698,7 @@ def check_scheduled_workflows() -> None:
                             and (
                                 workflow_runs.first().run_at
                                 > now
-                                - datetime.timedelta(
+                                - dt.timedelta(
                                     days=trigger.schedule_recurring_interval_days,
                                 )
                             )
