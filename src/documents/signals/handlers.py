@@ -23,6 +23,7 @@ from django.db import DatabaseError
 from django.db import close_old_connections
 from django.db import connections
 from django.db import models
+from django.db import transaction
 from django.db.models import Q
 from django.dispatch import receiver
 from django.utils import timezone
@@ -1432,7 +1433,11 @@ def add_or_update_document_in_llm_index(sender, document, **kwargs):
     if ai_config.llm_index_enabled:
         from documents.tasks import update_document_in_llm_index
 
-        update_document_in_llm_index.apply_async(kwargs={"document_id": document.pk})
+        transaction.on_commit(
+            lambda: update_document_in_llm_index.apply_async(
+                kwargs={"document_id": document.pk},
+            ),
+        )
 
 
 @receiver(models.signals.post_delete, sender=Document)

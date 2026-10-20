@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 import pytest_mock
 from django.db import connection
+from django.test import captureOnCommitCallbacks
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -23,6 +24,7 @@ from documents.signals import document_consumption_finished
 from documents.signals import document_updated
 from paperless.models import ApplicationConfiguration
 from paperless_ai import indexing
+from paperless_ai.exceptions import EmbeddingCapacityDeferred
 from paperless_ai.exceptions import EmbeddingRateLimitError
 from paperless_ai.tests.conftest import FakeEmbedding
 from paperless_ai.vector_store import PaperlessSqliteVecVectorStore
@@ -105,6 +107,17 @@ def test_reservation_rejects_impossible_metered_batch(tmp_path: Path) -> None:
                 "fake-openai-embedding",
                 ["x" * (indexing._EMBEDDING_TPM_LIMIT * 3 + 1)],
             )
+
+
+def test_reservation_deferral_is_distinct_from_provider_rate_limit(
+    tmp_path: Path,
+) -> None:
+    with patch.object(indexing.settings, "DATA_DIR", tmp_path):
+        pacing = indexing._embedding_pacing_path("fake-openai-embedding")
+        pacing.parent.mkdir(parents=True, exist_ok=True)
+        pacing.write_text('{"last_request": 9999999999, "events": []}')
+        with pytest.raises(EmbeddingCapacityDeferred):
+            indexing._reserve_embedding_capacity("fake-openai-embedding", ["text"])
 
 
 def test_metered_checkpoint_retry_only_reembeds_remaining_batches(
@@ -920,7 +933,8 @@ class TestDocumentUpdatedSignalTriggersLlmReindex:
         mock_task = mocker.patch("documents.tasks.update_document_in_llm_index")
 
         doc = DocumentFactory()
-        document_updated.send(sender=object, document=doc)
+        with captureOnCommitCallbacks(execute=True):
+            document_updated.send(sender=object, document=doc)
 
         mock_task.apply_async.assert_called_once_with(kwargs={"document_id": doc.pk})
 

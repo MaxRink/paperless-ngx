@@ -19,3 +19,7 @@ class EmbeddingRateLimitError(LLMProviderError):
 
     def __str__(self) -> str:
         return f"Embedding provider requested retry after {self.retry_after:g}s"
+
+
+class EmbeddingCapacityDeferred(EmbeddingRateLimitError):
+    """Local pacing deferred a request before contacting the provider."""

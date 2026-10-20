@@ -76,6 +76,7 @@ from paperless.config import RemoteOCRConfig
 from paperless.logging import consume_task_id
 from paperless.parsers import ParserContext
 from paperless.parsers.registry import get_parser_registry
+from paperless_ai.exceptions import EmbeddingCapacityDeferred
 from paperless_ai.exceptions import EmbeddingRateLimitError
 from paperless_ai.exceptions import LLMTimeoutError
 from paperless_ai.indexing import llm_index_add_or_update_document
@@ -806,6 +807,17 @@ def llmindex_index(
             rebuild=rebuild,
             document_ids=document_ids,
         )
+    except EmbeddingCapacityDeferred as exc:
+        _defer_embedding_retry(
+            self,
+            exc,
+            kwargs={
+                "rebuild": False,
+                "document_ids": document_ids,
+                "provider_attempts": provider_attempts,
+                "not_before": time.time() + exc.retry_after,
+            },
+        )
     except EmbeddingRateLimitError as exc:
         if provider_attempts >= _EMBEDDING_PROVIDER_MAX_ATTEMPTS - 1:
             raise
@@ -908,6 +920,16 @@ def update_document_in_llm_index(
         )
     try:
         llm_index_add_or_update_document(document)
+    except EmbeddingCapacityDeferred as exc:
+        _defer_embedding_retry(
+            self,
+            exc,
+            kwargs={
+                "document_id": document_id,
+                "provider_attempts": provider_attempts,
+                "not_before": time.time() + exc.retry_after,
+            },
+        )
     except EmbeddingRateLimitError as exc:
         if provider_attempts >= _EMBEDDING_PROVIDER_MAX_ATTEMPTS - 1:
             raise

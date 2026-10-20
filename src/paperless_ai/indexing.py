@@ -34,6 +34,7 @@ from paperless_ai.db import db_connection_released
 from paperless_ai.embedding import build_llm_index_text
 from paperless_ai.embedding import get_configured_model_name
 from paperless_ai.embedding import get_embedding_model
+from paperless_ai.exceptions import EmbeddingCapacityDeferred
 from paperless_ai.exceptions import EmbeddingRateLimitError
 
 if TYPE_CHECKING:
@@ -447,11 +448,11 @@ def _reserve_embedding_capacity(model_name: str, texts: list[str]) -> None:
                     _EMBEDDING_TPM_WINDOW_SECONDS - (now - events[0][0]),
                 )
             if wait > 0:
-                raise EmbeddingRateLimitError(wait)
+                raise EmbeddingCapacityDeferred(wait)
             events.append([now, request_tokens])
             _write_embedding_pacing(path, {"last_request": now, "events": events})
     except Timeout as exc:
-        raise EmbeddingRateLimitError(1.0) from exc
+        raise EmbeddingCapacityDeferred(1.0) from exc
 
 
 def _estimate_embedding_tokens(texts: list[str]) -> int:
