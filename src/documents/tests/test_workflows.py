@@ -2451,7 +2451,9 @@ class TestWorkflows(
         CustomFieldInstance.objects.create(
             document=doc,
             field=self.cf1,
-            value_date=timezone.now() - timedelta(days=2),
+            # Keep this as a date value: the scheduled custom-field path must
+            # combine it with midnight before applying the offset.
+            value_date=timezone.localdate() - timedelta(days=2),
         )
 
         tasks.check_scheduled_workflows()

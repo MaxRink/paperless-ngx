@@ -655,7 +655,7 @@ def check_scheduled_workflows() -> None:
                             if cfi.value_date
                             and (
                                 timezone.make_aware(
-                                    dt.dt.combine(
+                                    dt.datetime.combine(
                                         cfi.value_date,
                                         dt.time.min,
                                     ),
