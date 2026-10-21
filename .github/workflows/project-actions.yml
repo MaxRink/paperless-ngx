@@ -16,7 +16,10 @@ jobs:
     permissions:
       # write permission is required for autolabeler
       pull-requests: write
-    if: github.event_name == 'pull_request_target' && (github.event.action == 'opened' || github.event.action == 'reopened') && github.event.pull_request.user.login != 'dependabot'
+    # Release-drafter needs release write permission and is only meaningful in
+    # the canonical repository. Fork PRs should retain ordinary CI without
+    # attempting to create releases with a read-only fork token.
+    if: github.repository == 'paperless-ngx/paperless-ngx' && github.event_name == 'pull_request_target' && (github.event.action == 'opened' || github.event.action == 'reopened') && github.event.pull_request.user.login != 'dependabot'
     steps:
       - name: Label PR with release-drafter
         uses: release-drafter/release-drafter@34d80673e067bdc0c24568d3af899c216adcfaa9 # v7.7.0

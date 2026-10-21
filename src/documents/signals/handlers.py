@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import datetime
+import datetime as dt
 import logging
 import shutil
 import traceback as _tb
@@ -23,6 +23,7 @@ from django.db import DatabaseError
 from django.db import close_old_connections
 from django.db import connections
 from django.db import models
+from django.db import transaction
 from django.db.models import Q
 from django.dispatch import receiver
 from django.utils import timezone
@@ -1106,7 +1107,7 @@ def _extract_input_data(
             for k, v in vars(overrides).items():
                 if v is None or k.startswith("_"):
                     continue
-                if isinstance(v, datetime.date):
+                if isinstance(v, dt.date):
                     v = v.isoformat()
                 elif isinstance(v, Path):
                     v = str(v)
@@ -1432,7 +1433,11 @@ def add_or_update_document_in_llm_index(sender, document, **kwargs):
     if ai_config.llm_index_enabled:
         from documents.tasks import update_document_in_llm_index
 
-        update_document_in_llm_index.apply_async(kwargs={"document": document})
+        transaction.on_commit(
+            lambda: update_document_in_llm_index.apply_async(
+                kwargs={"document_id": document.pk},
+            ),
+        )
 
 
 @receiver(models.signals.post_delete, sender=Document)

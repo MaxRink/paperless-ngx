@@ -31,6 +31,7 @@ from django.contrib.auth.models import Group
 from django.contrib.auth.models import User
 from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import connections
 from django.db.migrations.loader import MigrationLoader
 from django.db.migrations.recorder import MigrationRecorder
@@ -584,6 +585,23 @@ class PermissionsAwareDocumentCountMixin(BulkPermissionMixin, PassUserMixin):
 
     def get_queryset(self):
         base_qs = super().get_queryset()
+
+        lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
+        lookup_kwargs = getattr(self, "kwargs", {})
+        if lookup_url_kwarg in lookup_kwargs:
+            lookup_field = (
+                base_qs.model._meta.pk
+                if self.lookup_field == "pk"
+                else base_qs.model._meta.get_field(self.lookup_field)
+            )
+            try:
+                lookup_value = lookup_field.to_python(lookup_kwargs[lookup_url_kwarg])
+            except (DjangoValidationError, TypeError, ValueError):
+                base_qs = base_qs.none()
+            else:
+                base_qs = base_qs.filter(
+                    **{self.lookup_field: lookup_value},
+                )
 
         if self.document_count_through:
             user = getattr(getattr(self, "request", None), "user", None)

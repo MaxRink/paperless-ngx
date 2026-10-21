@@ -1,5 +1,6 @@
 import datetime
 import uuid
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Final
 
@@ -11,9 +12,12 @@ from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator
 from django.core.validators import MinValueValidator
 from django.db import models
+from django.db import router
+from django.db import transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from multiselectfield import MultiSelectField
+from treenode.cache import clear_cache
 from treenode.models import TreeNodeModel
 
 if settings.AUDIT_LOG_ENABLED:
@@ -100,6 +104,23 @@ class Correspondent(MatchingModel):
         verbose_name_plural = _("correspondents")
 
 
+_tag_tree_updates = ContextVar("tag_tree_updates", default=True)
+
+
+class TagQuerySet(models.QuerySet):
+    def delete(self):
+        # One rebuild after a bulk deletion, without disconnecting shared signals.
+        with transaction.atomic(using=self.db):
+            token = _tag_tree_updates.set(False)
+            try:
+                result = super().delete()
+            finally:
+                _tag_tree_updates.reset(token)
+            if result[0]:
+                self.model.update_tree()
+        return result
+
+
 class Tag(MatchingModel, TreeNodeModel):
     color = models.CharField(_("color"), max_length=7, default="#a6cee3")
     # Maximum allowed nesting depth for tags (root = 1, max depth = 5)
@@ -114,9 +135,63 @@ class Tag(MatchingModel, TreeNodeModel):
         ),
     )
 
+    objects = TagQuerySet.as_manager()
+
     class Meta(MatchingModel.Meta, TreeNodeModel.Meta):
         verbose_name = _("tag")
         verbose_name_plural = _("tags")
+
+    def save(self, *args, **kwargs):
+        if args:
+            return super().save(*args, **kwargs)
+        tree_fields = tuple(
+            field.attname
+            for field in self._meta.concrete_fields
+            if field.name.startswith("tn_")
+        )
+        structural_fields = tuple(
+            field for field in tree_fields if field in {"tn_parent_id", "tn_priority"}
+        )
+        previous = None
+        if not self._state.adding:
+            database = kwargs.get("using") or router.db_for_write(
+                type(self),
+                instance=self,
+            )
+            previous = (
+                type(self)
+                ._base_manager.using(database)
+                .filter(pk=self.pk)
+                .values(*structural_fields)
+                .first()
+            )
+        metadata_only = previous is not None and previous == {
+            field: getattr(self, field) for field in structural_fields
+        }
+        if not metadata_only:
+            return super().save(*args, **kwargs)
+        # Do not overwrite tree bookkeeping changed by a concurrent structural edit.
+        fields = kwargs.get("update_fields")
+        kwargs["update_fields"] = {
+            field.name
+            for field in self._meta.concrete_fields
+            if not field.primary_key
+            and not field.name.startswith("tn_")
+            and (fields is None or field.name in fields or field.attname in fields)
+        }
+        # Normal saves/audit signals remain active; cached labels are invalidated.
+        token = _tag_tree_updates.set(False)
+        try:
+            result = super().save(*args, **kwargs)
+        finally:
+            _tag_tree_updates.reset(token)
+        clear_cache(type(self))
+        return result
+
+    @classmethod
+    def update_tree(cls):
+        if _tag_tree_updates.get():
+            super().update_tree()
 
     def clean(self) -> None:
         # Prevent self-parenting and assigning a descendant as parent
