@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 import pytest_mock
 from django.db import connection
+from django.db import transaction
 from django.test import TestCase
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
@@ -940,6 +941,23 @@ class TestDocumentUpdatedSignalTriggersLlmReindex:
             document_updated.send(sender=object, document=doc)
 
         mock_task.apply_async.assert_called_once_with(kwargs={"document_id": doc.pk})
+
+    @pytest.mark.django_db
+    @override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")
+    def test_document_updated_does_not_enqueue_before_rollback(
+        self,
+        mocker: pytest_mock.MockerFixture,
+    ) -> None:
+        mock_task = mocker.patch("documents.tasks.update_document_in_llm_index")
+        doc = DocumentFactory()
+        with TestCase.captureOnCommitCallbacks(execute=False) as callbacks:
+            with pytest.raises(RuntimeError, match="rollback"):
+                with transaction.atomic():
+                    document_updated.send(sender=object, document=doc)
+                    mock_task.apply_async.assert_not_called()
+                    raise RuntimeError("rollback")
+        assert callbacks == []
+        mock_task.apply_async.assert_not_called()
 
     @pytest.mark.django_db
     @override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")
