@@ -906,6 +906,9 @@ def llm_index_add_or_update_document(document: Document):
     if document.root_document_id is not None:
         document = document.root_document
     config = AIConfig()
+    model_name = get_configured_model_name(config)
+    with read_store() as store:
+        store.validate_model_identity(model_name)
     new_nodes = build_document_node(
         document,
         chunk_size=config.llm_embedding_chunk_size,
@@ -914,10 +917,12 @@ def llm_index_add_or_update_document(document: Document):
         _embed_nodes(
             new_nodes,
             get_embedding_model(config),
-            model_name=get_configured_model_name(config),
+            model_name=model_name,
         )
 
-    with write_store(embed_model_name=get_configured_model_name(config)) as store:
+    with write_store(embed_model_name=model_name) as store:
+        # A rebuild may have changed the index while the provider was running.
+        store.validate_model_identity(model_name)
         migration_result = _check_and_run_migrations(store)
         if migration_result is MigrationCheckResult.REEMBED_REQUIRED:
             logger.warning(

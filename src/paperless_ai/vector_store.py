@@ -310,6 +310,27 @@ class PaperlessSqliteVecVectorStore(BasePydanticVectorStore):
             return False
         return stored != model_name
 
+    def validate_model_identity(self, model_name: str) -> None:
+        """Refuse incremental writes into incompatible or unidentifiable vectors."""
+        if not self.table_exists():
+            return
+        stored = self.stored_model_name()
+        if stored == model_name:
+            return
+        if (
+            stored is None
+            and self._conn.execute(
+                "SELECT 1 FROM " + DEFAULT_TABLE_NAME + " LIMIT 1",
+            ).fetchone()
+            is None
+        ):
+            return
+        raise ValueError(
+            "LLM index embedding model identity is unknown or does not match "
+            "the configured model; verify the index and embedding configuration "
+            "before retrying.",
+        )
+
     @staticmethod
     def _create_vec_table(conn: sqlite3.Connection, dim: int) -> None:
         # document_id is deliberately a metadata column, NOT a partition key:
@@ -447,6 +468,8 @@ class PaperlessSqliteVecVectorStore(BasePydanticVectorStore):
         doc_id = int(document_id)
         rows = [self._row(node) for node in nodes]
         with self._transaction():
+            if self._embed_model_name:
+                self.validate_model_identity(self._embed_model_name)
             table_exists = self.table_exists()
             if nodes and not table_exists:
                 self._ensure_table(
@@ -460,6 +483,9 @@ class PaperlessSqliteVecVectorStore(BasePydanticVectorStore):
                 self._conn.executemany(_INSERT, _vec0_params(rows))
                 self._index_chunks(rows)
                 self._increment_total_inserts(len(rows))
+                if self._embed_model_name and self.stored_model_name() is None:
+                    # Only an empty, unlabelled table passed the identity check.
+                    IndexMetaTable.set_embed_model(self._conn, self._embed_model_name)
         return [node.node_id for node in nodes]
 
     def delete(self, ref_doc_id: int | str, **delete_kwargs: Any) -> None:
