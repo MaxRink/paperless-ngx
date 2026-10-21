@@ -149,6 +149,9 @@ class Tag(MatchingModel, TreeNodeModel):
             for field in self._meta.concrete_fields
             if field.name.startswith("tn_")
         )
+        structural_fields = tuple(
+            field for field in tree_fields if field in {"tn_parent_id", "tn_priority"}
+        )
         previous = None
         if not self._state.adding:
             database = kwargs.get("using") or router.db_for_write(
@@ -159,11 +162,11 @@ class Tag(MatchingModel, TreeNodeModel):
                 type(self)
                 ._base_manager.using(database)
                 .filter(pk=self.pk)
-                .values(*tree_fields)
+                .values(*structural_fields)
                 .first()
             )
         metadata_only = previous is not None and previous == {
-            field: getattr(self, field) for field in tree_fields
+            field: getattr(self, field) for field in structural_fields
         }
         if not metadata_only:
             return super().save(*args, **kwargs)
