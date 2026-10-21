@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 import pytest_mock
 from django.db import connection
-from django.test import captureOnCommitCallbacks
+from django.test import TestCase
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -936,7 +936,7 @@ class TestDocumentUpdatedSignalTriggersLlmReindex:
         mock_task = mocker.patch("documents.tasks.update_document_in_llm_index")
 
         doc = DocumentFactory()
-        with captureOnCommitCallbacks(execute=True):
+        with TestCase.captureOnCommitCallbacks(execute=True):
             document_updated.send(sender=object, document=doc)
 
         mock_task.apply_async.assert_called_once_with(kwargs={"document_id": doc.pk})
