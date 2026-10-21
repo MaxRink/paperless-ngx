@@ -23,6 +23,8 @@ from documents.models import Note
 from documents.models import PaperlessTask
 from documents.signals import document_consumption_finished
 from documents.signals import document_updated
+from documents.tasks import llmindex_index
+from documents.tasks import update_document_in_llm_index
 from paperless.models import ApplicationConfiguration
 from paperless_ai import indexing
 from paperless_ai.exceptions import EmbeddingCapacityDeferred
@@ -119,6 +121,97 @@ def test_reservation_deferral_is_distinct_from_provider_rate_limit(
         pacing.write_text('{"last_request": 9999999999, "events": []}')
         with pytest.raises(EmbeddingCapacityDeferred):
             indexing._reserve_embedding_capacity("fake-openai-embedding", ["text"])
+
+
+@pytest.mark.django_db
+def test_repeated_local_capacity_deferrals_do_not_consume_provider_attempts(
+    mocker: pytest_mock.MockerFixture,
+) -> None:
+    """Local pacing must remain retryable beyond the provider retry budget."""
+
+    class RetrySent(Exception):
+        pass
+
+    retry_calls: list[dict[str, object]] = []
+    clock = [100.0]
+
+    document = DocumentFactory()
+    index_update = mocker.patch(
+        "documents.tasks.llm_index_add_or_update_document",
+        side_effect=[EmbeddingCapacityDeferred(1)] * 4 + [None],
+    )
+    mocker.patch("documents.tasks.time.time", side_effect=lambda: clock[0])
+
+    def retry(**kwargs: object) -> None:
+        retry_calls.append(kwargs)
+        raise RetrySent
+
+    mocker.patch.object(update_document_in_llm_index, "retry", side_effect=retry)
+
+    retry_kwargs: dict[str, object] = {
+        "document_id": document.pk,
+        "provider_attempts": 0,
+    }
+    for _ in range(4):
+        with pytest.raises(RetrySent):
+            update_document_in_llm_index.run(**retry_kwargs)
+        retry_kwargs = retry_calls[-1]["kwargs"]
+        clock[0] = float(retry_kwargs["not_before"]) + 1
+
+    update_document_in_llm_index.run(**retry_kwargs)
+
+    assert len(retry_calls) == 4
+    assert [call["kwargs"]["provider_attempts"] for call in retry_calls] == [0] * 4
+    assert index_update.call_count == 5
+
+
+@pytest.mark.django_db
+@override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")
+def test_bulk_local_capacity_deferrals_do_not_consume_provider_attempts(
+    mocker: pytest_mock.MockerFixture,
+) -> None:
+    """Bulk indexing keeps retrying local pacing without provider attempts."""
+
+    class RetrySent(Exception):
+        pass
+
+    retry_calls: list[dict[str, object]] = []
+    clock = [100.0]
+    promoted = EmbeddingCapacityDeferred(1)
+    promoted.full_rebuild = True
+    index_update = mocker.patch(
+        "paperless_ai.indexing.update_llm_index",
+        side_effect=[
+            promoted,
+            EmbeddingCapacityDeferred(1),
+            EmbeddingCapacityDeferred(1),
+            EmbeddingCapacityDeferred(1),
+            None,
+        ],
+    )
+    mocker.patch("documents.tasks.time.time", side_effect=lambda: clock[0])
+
+    def retry(**kwargs: object) -> None:
+        retry_calls.append(kwargs)
+        raise RetrySent
+
+    mocker.patch.object(llmindex_index, "retry", side_effect=retry)
+    retry_kwargs: dict[str, object] = {
+        "rebuild": False,
+        "document_ids": [1, 2],
+        "provider_attempts": 0,
+    }
+    for _ in range(4):
+        with pytest.raises(RetrySent):
+            llmindex_index.run(**retry_kwargs)
+        retry_kwargs = retry_calls[-1]["kwargs"]
+        clock[0] = float(retry_kwargs["not_before"]) + 1
+
+    llmindex_index.run(**retry_kwargs)
+    assert len(retry_calls) == 4
+    assert [call["kwargs"]["provider_attempts"] for call in retry_calls] == [0] * 4
+    assert retry_calls[0]["kwargs"]["document_ids"] is None
+    assert index_update.call_count == 5
 
 
 def test_metered_checkpoint_retry_only_reembeds_remaining_batches(
@@ -969,14 +1062,15 @@ class TestDocumentUpdatedSignalTriggersLlmReindex:
         mock_task = mocker.patch("documents.tasks.update_document_in_llm_index")
 
         root_doc = DocumentFactory()
-        document_consumption_finished.send(
-            sender=object,
-            document=root_doc,
-            logging_group=None,
-            classifier=None,
-            original_file=None,
-        )
-        document_updated.send(sender=object, document=root_doc, skip_ai_index=True)
+        with TestCase.captureOnCommitCallbacks(execute=True):
+            document_consumption_finished.send(
+                sender=object,
+                document=root_doc,
+                logging_group=None,
+                classifier=None,
+                original_file=None,
+            )
+            document_updated.send(sender=object, document=root_doc, skip_ai_index=True)
 
         assert mock_task.apply_async.call_count == 1
 

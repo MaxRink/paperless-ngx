@@ -813,7 +813,9 @@ def llmindex_index(
             exc,
             kwargs={
                 "rebuild": False,
-                "document_ids": document_ids,
+                "document_ids": (
+                    None if getattr(exc, "full_rebuild", False) else document_ids
+                ),
                 "provider_attempts": provider_attempts,
                 "not_before": time.time() + exc.retry_after,
             },
