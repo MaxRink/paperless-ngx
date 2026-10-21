@@ -813,6 +813,100 @@ def test_add_or_update_document_updates_existing_entry(
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize("stored_model", ["other-model", None])
+def test_incremental_write_rejects_incompatible_model_before_embedding(
+    temp_llm_index_dir: Path,
+    real_document: Document,
+    mock_embed_model: FakeEmbedding,
+    stored_model: str | None,
+) -> None:
+    with patch.object(indexing, "get_configured_model_name", return_value="model-a"):
+        indexing.llm_index_add_or_update_document(real_document)
+        with indexing.write_store() as store:
+            if stored_model is None:
+                store.client.execute("DELETE FROM index_meta WHERE key = 'embed_model'")
+            else:
+                store.client.execute(
+                    "UPDATE index_meta SET value = ? WHERE key = 'embed_model'",
+                    (stored_model,),
+                )
+            before = list(store.client.iterdump())
+
+        # Both configured models produce the same dimensions: identity must win.
+        with (
+            patch.object(indexing, "get_embedding_model") as get_model,
+            patch.object(indexing, "build_document_node") as build_nodes,
+            patch.object(indexing, "queue_llm_index_update_if_needed") as queue,
+            pytest.raises(ValueError, match="embedding model identity"),
+        ):
+            indexing.llm_index_add_or_update_document(real_document)
+        get_model.assert_not_called()
+        build_nodes.assert_not_called()
+        queue.assert_not_called()
+        with indexing.read_store() as store:
+            assert list(store.client.iterdump()) == before
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("initial_state", ["new", "matching", "empty-unlabelled"])
+def test_incremental_write_initializes_or_preserves_model_identity(
+    temp_llm_index_dir: Path,
+    real_document: Document,
+    mock_embed_model: FakeEmbedding,
+    initial_state: str,
+) -> None:
+    with patch.object(indexing, "get_configured_model_name", return_value="model-a"):
+        if initial_state != "new":
+            indexing.llm_index_add_or_update_document(real_document)
+        if initial_state == "empty-unlabelled":
+            with indexing.write_store() as store:
+                store.delete(str(real_document.pk))
+                store.client.execute("DELETE FROM index_meta WHERE key = 'embed_model'")
+
+        real_document.content = "Updated synthetic content for incremental indexing."
+        real_document.save()
+        indexing.llm_index_add_or_update_document(real_document)
+
+    with indexing.read_store() as store:
+        assert store.stored_model_name() == "model-a"
+        assert store.get_modified_times() == {
+            str(real_document.pk): real_document.modified.isoformat(),
+        }
+        assert all(real_document.content in node.text for node in store.get_nodes())
+
+
+@pytest.mark.django_db
+def test_incremental_write_rechecks_model_after_concurrent_rebuild(
+    temp_llm_index_dir: Path,
+    real_document: Document,
+    mock_embed_model: FakeEmbedding,
+) -> None:
+    with patch.object(indexing, "get_configured_model_name", return_value="model-a"):
+        indexing.llm_index_add_or_update_document(real_document)
+        with indexing.read_store() as store:
+            old_nodes = store.get_nodes()
+        embed = indexing._embed_nodes
+        rebuilt_state = []
+
+        def embed_then_rebuild(*args, **kwargs):
+            embed(*args, **kwargs)
+            with indexing.write_store(embed_model_name="model-b") as store:
+                store.drop_table()
+                store.add(old_nodes)
+                rebuilt_state.extend(store.client.iterdump())
+
+        with (
+            patch.object(indexing, "_embed_nodes", side_effect=embed_then_rebuild),
+            pytest.raises(ValueError, match="embedding model identity"),
+        ):
+            indexing.llm_index_add_or_update_document(real_document)
+
+    with indexing.read_store() as store:
+        assert list(store.client.iterdump()) == rebuilt_state
+        assert store.stored_model_name() == "model-b"
+
+
+@pytest.mark.django_db
 def test_query_after_remove_does_not_raise_key_error(
     temp_llm_index_dir: Path,
     real_document: Document,
