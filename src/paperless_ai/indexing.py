@@ -518,7 +518,8 @@ def _embedding_requires_pacing(
     unmetered_models = {
         alias.strip()
         for alias in os.environ.get(
-            "PAPERLESS_AI_UNMETERED_EMBEDDING_MODELS", "",
+            "PAPERLESS_AI_UNMETERED_EMBEDDING_MODELS",
+            "",
         ).split(",")
         if alias.strip()
     }

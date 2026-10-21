@@ -145,7 +145,9 @@ def test_metered_checkpoint_retry_only_reembeds_remaining_batches(
     def reserve(_model_name: str, batch: list[str]) -> None:
         nonlocal reservations
         reservations += 1
-        assert indexing._estimate_embedding_tokens(batch) <= indexing._EMBEDDING_TPM_LIMIT
+        assert (
+            indexing._estimate_embedding_tokens(batch) <= indexing._EMBEDDING_TPM_LIMIT
+        )
 
     model = MagicMock(embed_batch_size=100)
     model.get_text_embedding_batch.side_effect = embed
@@ -193,6 +195,7 @@ def test_embedding_pacing_allowlist_is_exact_and_openai_only(
     module: str,
     model_name: str | None,
     allowlist: str | None,
+    *,
     expected: bool,
 ) -> None:
     if allowlist is None:
