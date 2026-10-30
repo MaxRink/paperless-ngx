@@ -526,7 +526,8 @@ def llm_index_add_or_update_document(document: Document):
     if new_nodes:
         _embed_nodes(new_nodes, get_embedding_model(config))
 
-    with write_store(embed_model_name=get_configured_model_name(config)) as store:
+    model_name = get_configured_model_name(config)
+    with write_store(embed_model_name=model_name) as store:
         migration_result = _check_and_run_migrations(store)
         if migration_result is MigrationCheckResult.REEMBED_REQUIRED:
             logger.warning(
@@ -542,6 +543,18 @@ def llm_index_add_or_update_document(document: Document):
                 "migration check deferred while index readers are active; "
                 "will retry on the next write.",
                 document.id,
+            )
+            return
+        if store.config_mismatch(model_name):
+            # Vectors from different models are not comparable, even when the
+            # dimension matches. The next index update performs the rebuild.
+            logger.warning(
+                "Skipping incremental LLM index update for document %s: the "
+                "index was built with embedding model %s, but %s is "
+                "configured. Run 'document_llmindex rebuild' to resolve.",
+                document.id,
+                store.stored_model_name(),
+                model_name,
             )
             return
         store.upsert_document(str(document.id), new_nodes)

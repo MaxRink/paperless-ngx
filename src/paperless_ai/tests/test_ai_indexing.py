@@ -255,6 +255,39 @@ def test_update_llm_index_rebuilds_on_model_name_change(
 
 
 @pytest.mark.django_db
+def test_add_or_update_document_skips_write_on_model_name_change(
+    temp_llm_index_dir: Path,
+    real_document: Document,
+    mock_embed_model: FakeEmbedding,
+    mocker: pytest_mock.MockerFixture,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An incremental update must not mix vectors from a different embedding
+    model into an index built with another model.
+    """
+    with patch(
+        "paperless_ai.indexing.get_configured_model_name",
+        return_value="model-a",
+    ):
+        indexing.llm_index_add_or_update_document(real_document)
+
+    upsert = mocker.spy(PaperlessSqliteVecVectorStore, "upsert_document")
+    with (
+        patch(
+            "paperless_ai.indexing.get_configured_model_name",
+            return_value="model-b",
+        ),
+        caplog.at_level(logging.WARNING, logger="paperless_ai.indexing"),
+    ):
+        indexing.llm_index_add_or_update_document(real_document)
+
+    upsert.assert_not_called()
+    assert "built with embedding model model-a" in caplog.text
+    with indexing.get_vector_store() as store:
+        assert store.stored_model_name() == "model-a"
+
+
+@pytest.mark.django_db
 def test_update_llm_index_merges_exists_and_config_mismatch_reads(
     temp_llm_index_dir: Path,
     real_document: Document,
@@ -829,6 +862,7 @@ class TestLlmIndexLocking:
             return_value=[mock_node],
         )
 
+        mock_store.config_mismatch.return_value = False
         doc = MagicMock(spec=Document)
         doc.id = 1
         indexing.llm_index_add_or_update_document(doc)
