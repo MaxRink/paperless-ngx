@@ -1,6 +1,7 @@
-import datetime
+import datetime as dt
 import logging
 import shutil
+import time
 import uuid
 import zipfile
 from collections.abc import Callable
@@ -75,14 +76,43 @@ from paperless.config import RemoteOCRConfig
 from paperless.logging import consume_task_id
 from paperless.parsers import ParserContext
 from paperless.parsers.registry import get_parser_registry
+from paperless_ai.exceptions import EmbeddingCapacityDeferred
+from paperless_ai.exceptions import EmbeddingRateLimitError
 from paperless_ai.exceptions import LLMTimeoutError
 from paperless_ai.indexing import llm_index_add_or_update_document
 from paperless_ai.indexing import llm_index_remove_document
-from paperless_ai.indexing import update_llm_index
 
 if settings.AUDIT_LOG_ENABLED:
     from auditlog.models import LogEntry
 logger = logging.getLogger("paperless.tasks")
+
+_EMBEDDING_RETRY_WAKEUP_SECONDS = 300
+_EMBEDDING_PROVIDER_MAX_ATTEMPTS = 3
+
+
+def _defer_embedding_retry(
+    task: Task,
+    exc: EmbeddingRateLimitError,
+    *,
+    kwargs: dict[str, object],
+) -> None:
+    """Wake an embedding task in short ETAs until the provider window ends.
+
+    Redis visibility timeouts are commonly one hour.  Scheduling a single ETA
+    for a provider's multi-hour window can therefore redeliver the original
+    message before its ETA.  Short wakeups avoid that lease problem while the
+    absolute ``not_before`` timestamp preserves the provider's full window.
+    ``provider_attempts`` is separate from Celery's wakeup retry counter.
+    """
+    now = time.time()
+    not_before = float(kwargs["not_before"])
+    delay = max(0.0, min(_EMBEDDING_RETRY_WAKEUP_SECONDS, not_before - now))
+    raise task.retry(
+        exc=exc,
+        countdown=delay,
+        kwargs=kwargs,
+        max_retries=None,
+    )
 
 
 @shared_task
@@ -317,9 +347,8 @@ def bulk_update_documents(document_ids) -> None:
 
     document_ids = list(document_ids)
     # Annotated so the signal handlers below (e.g. matching) don't query the
-    # versions of each document. Indexing re-queries and re-annotates its own
-    # copy via add_or_update_ids() below, after these signals (and any
-    # workflow they trigger) have had a chance to mutate the documents.
+    # versions of each document. The dedicated index task re-queries and
+    # re-annotates its own copy after these signals and workflows complete.
     documents = annotate_effective_content(
         Document.objects.filter(id__in=document_ids),
     )
@@ -330,7 +359,7 @@ def bulk_update_documents(document_ids) -> None:
             sender=None,
             document=doc,
             logging_group=uuid.uuid4(),
-            skip_ai_index=True,  # bulk path calls update_llm_index once below
+            skip_ai_index=True,  # bulk path enqueues one index task below
         )
         post_save.send(Document, instance=doc, created=False)
 
@@ -339,9 +368,10 @@ def bulk_update_documents(document_ids) -> None:
 
     ai_config = AIConfig()
     if ai_config.llm_index_enabled:
-        update_llm_index(
-            rebuild=False,
-            document_ids=document_ids,
+        # Keep embedding quota waits out of this task. The document updates
+        # above are already committed; the dedicated index task owns retries.
+        llmindex_index.apply_async(
+            kwargs={"rebuild": False, "document_ids": document_ids},
         )
 
 
@@ -499,7 +529,9 @@ def update_document_content_maybe_archive_file(
 
             ai_config = AIConfig()
             if ai_config.llm_index_enabled:
-                llm_index_add_or_update_document(document)
+                update_document_in_llm_index.apply_async(
+                    kwargs={"document_id": document.pk},
+                )
 
             clear_document_caches(document.pk)
             if document.root_document_id is not None:
@@ -520,7 +552,7 @@ def empty_trash(doc_ids=None) -> None:
         if doc_ids is not None
         else Document.deleted_objects.filter(
             deleted_at__lt=timezone.localtime(timezone.now())
-            - datetime.timedelta(
+            - dt.timedelta(
                 days=settings.EMPTY_TRASH_DELAY,
             ),
         )
@@ -573,7 +605,7 @@ def check_scheduled_workflows() -> None:
             trigger: WorkflowTrigger
             for trigger in schedule_triggers:
                 documents = Document.objects.none()
-                offset_td = datetime.timedelta(days=trigger.schedule_offset_days)
+                offset_td = dt.timedelta(days=trigger.schedule_offset_days)
                 threshold = now - offset_td
                 logger.debug(
                     f"Trigger {trigger.id}: checking if (date + {offset_td}) <= now ({now})",
@@ -600,7 +632,7 @@ def check_scheduled_workflows() -> None:
 
                     case WorkflowTrigger.ScheduleDateField.CUSTOM_FIELD:
                         # cap earliest date to avoid massive scans
-                        earliest_date = now - datetime.timedelta(days=365)
+                        earliest_date = now - dt.timedelta(days=365)
                         if offset_td.days < -365:
                             logger.warning(
                                 f"Trigger {trigger.id} has large negative offset ({offset_td.days}), "
@@ -624,9 +656,9 @@ def check_scheduled_workflows() -> None:
                             if cfi.value_date
                             and (
                                 timezone.make_aware(
-                                    datetime.datetime.combine(
+                                    dt.datetime.combine(
                                         cfi.value_date,
-                                        datetime.time.min,
+                                        dt.time.min,
                                     ),
                                 )
                                 + offset_td
@@ -667,7 +699,7 @@ def check_scheduled_workflows() -> None:
                             and (
                                 workflow_runs.first().run_at
                                 > now
-                                - datetime.timedelta(
+                                - dt.timedelta(
                                     days=trigger.schedule_recurring_interval_days,
                                 )
                             )
@@ -740,11 +772,15 @@ def update_document_parent_tags(tag: Tag, new_parent: Tag) -> None:
         )
 
 
-@shared_task
+@shared_task(bind=True, max_retries=None)
 def llmindex_index(
+    self,
     *,
     iter_wrapper: IterWrapper[Document] = identity,
     rebuild: bool = False,
+    document_ids: list[int] | None = None,
+    provider_attempts: int = 0,
+    not_before: float | None = None,
 ) -> str | None:
     ai_config = AIConfig()
     if not ai_config.llm_index_enabled:  # pragma: no cover
@@ -753,10 +789,58 @@ def llmindex_index(
 
     from paperless_ai.indexing import update_llm_index
 
-    return update_llm_index(
-        iter_wrapper=iter_wrapper,
-        rebuild=rebuild,
-    )
+    if not_before is not None and time.time() < not_before:
+        _defer_embedding_retry(
+            self,
+            EmbeddingRateLimitError(not_before - time.time()),
+            kwargs={
+                "rebuild": False,
+                "document_ids": document_ids,
+                "provider_attempts": provider_attempts,
+                "not_before": not_before,
+            },
+        )
+
+    try:
+        return update_llm_index(
+            iter_wrapper=iter_wrapper,
+            rebuild=rebuild,
+            document_ids=document_ids,
+        )
+    except EmbeddingCapacityDeferred as exc:
+        _defer_embedding_retry(
+            self,
+            exc,
+            kwargs={
+                "rebuild": False,
+                "document_ids": (
+                    None if getattr(exc, "full_rebuild", False) else document_ids
+                ),
+                "provider_attempts": provider_attempts,
+                "not_before": time.time() + exc.retry_after,
+            },
+        )
+    except EmbeddingRateLimitError as exc:
+        if provider_attempts >= _EMBEDDING_PROVIDER_MAX_ATTEMPTS - 1:
+            raise
+        # Completed documents are persisted before the next one is embedded;
+        # resume incrementally so a long provider window does not replay them.
+        _defer_embedding_retry(
+            self,
+            exc,
+            kwargs={
+                "rebuild": False,
+                # A scoped request may have been promoted to a full rebuild
+                # because the stored embedding model changed. Resume the
+                # complete index in that case, while existing rows are still
+                # skipped by their modified timestamps.
+                "document_ids": (
+                    None if getattr(exc, "full_rebuild", False) else document_ids
+                ),
+                "provider_attempts": provider_attempts + 1,
+                "not_before": time.time() + exc.retry_after,
+            },
+        )
 
 
 @shared_task(
@@ -795,12 +879,71 @@ def apply_ai_suggestions(self, action_id: int, document_id: int) -> None:
 
     ai_config = AIConfig()
     if ai_config.llm_index_enabled:
-        update_document_in_llm_index.apply_async(kwargs={"document": document})
+        update_document_in_llm_index.apply_async(kwargs={"document_id": document.pk})
 
 
-@shared_task
-def update_document_in_llm_index(document) -> None:
-    llm_index_add_or_update_document(document)
+@shared_task(bind=True, max_retries=None)
+def update_document_in_llm_index(
+    self,
+    document_id: int | Document | None = None,
+    *,
+    document: Document | None = None,
+    provider_attempts: int = 0,
+    not_before: float | None = None,
+) -> None:
+    # Accept old queued messages that carried a pickled Document while all new
+    # producers use a primary key. Always reload by primary key before work.
+    if document is not None:
+        document_id = document.pk
+    elif document_id is not None and not isinstance(document_id, int):
+        document_id = document_id.pk
+    if document_id is None:
+        raise ValueError("document_id is required")
+    try:
+        document = Document.objects.get(pk=document_id)
+    except Document.DoesNotExist:
+        # A queued update can outlive the document transaction. Treat that
+        # race as a successful no-op instead of retrying a permanently
+        # impossible embedding request.
+        logger.info(
+            "Document %s no longer exists, skipping LLM index update",
+            document_id,
+        )
+        return
+    if not_before is not None and time.time() < not_before:
+        _defer_embedding_retry(
+            self,
+            EmbeddingRateLimitError(not_before - time.time()),
+            kwargs={
+                "document_id": document_id,
+                "provider_attempts": provider_attempts,
+                "not_before": not_before,
+            },
+        )
+    try:
+        llm_index_add_or_update_document(document)
+    except EmbeddingCapacityDeferred as exc:
+        _defer_embedding_retry(
+            self,
+            exc,
+            kwargs={
+                "document_id": document_id,
+                "provider_attempts": provider_attempts,
+                "not_before": time.time() + exc.retry_after,
+            },
+        )
+    except EmbeddingRateLimitError as exc:
+        if provider_attempts >= _EMBEDDING_PROVIDER_MAX_ATTEMPTS - 1:
+            raise
+        _defer_embedding_retry(
+            self,
+            exc,
+            kwargs={
+                "document_id": document_id,
+                "provider_attempts": provider_attempts + 1,
+                "not_before": time.time() + exc.retry_after,
+            },
+        )
 
 
 @shared_task

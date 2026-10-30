@@ -6,6 +6,8 @@ from unittest.mock import patch
 import pytest
 import pytest_mock
 from django.db import connection
+from django.db import transaction
+from django.test import TestCase
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -21,12 +23,317 @@ from documents.models import Note
 from documents.models import PaperlessTask
 from documents.signals import document_consumption_finished
 from documents.signals import document_updated
+from documents.tasks import llmindex_index
+from documents.tasks import update_document_in_llm_index
 from paperless.models import ApplicationConfiguration
 from paperless_ai import indexing
+from paperless_ai.exceptions import EmbeddingCapacityDeferred
+from paperless_ai.exceptions import EmbeddingRateLimitError
 from paperless_ai.tests.conftest import FakeEmbedding
 from paperless_ai.vector_store import PaperlessSqliteVecVectorStore
 from paperless_testing.factories import DocumentFactory
 from paperless_testing.factories import PaperlessTaskFactory
+
+
+def test_metered_embedding_batches_respect_provider_token_limit() -> None:
+    texts = ["a" * 40_000, "b" * 40_000, "c" * 40_000]
+
+    batches = list(indexing._embedding_batch_slices(texts, 100, metered=True))
+
+    assert [len(batch) for batch in batches] == [1, 1, 1]
+    assert all(
+        indexing._estimate_embedding_tokens(batch) <= indexing._EMBEDDING_TPM_LIMIT
+        for batch in batches
+    )
+
+
+def test_metered_embedding_batch_rejects_oversized_single_chunk() -> None:
+    with pytest.raises(ValueError, match="single embedding chunk"):
+        list(
+            indexing._embedding_batch_slices(
+                ["x" * (indexing._EMBEDDING_TPM_LIMIT * 3 * 3 + 1)],
+                100,
+                metered=True,
+            ),
+        )
+
+
+def test_local_embedding_batches_keep_configured_batch_size() -> None:
+    texts = ["one", "two", "three"]
+
+    batches = list(indexing._embedding_batch_slices(texts, 2, metered=False))
+
+    assert batches == [["one", "two"], ["three"]]
+
+
+def test_embed_nodes_splits_metered_provider_batches_before_reservation(
+    tmp_path: Path,
+) -> None:
+    class Node:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.embedding = None
+
+        def get_content(self, *, metadata_mode) -> str:
+            return self.text
+
+    nodes = [Node("a" * 40_000), Node("b" * 40_000), Node("c" * 40_000)]
+    batches: list[list[str]] = []
+    model = MagicMock(embed_batch_size=100)
+    model.get_text_embedding_batch.side_effect = lambda batch: (
+        batches.append(batch) or [[0.1] for _ in batch]
+    )
+
+    reservations: list[int] = []
+
+    def reserve(_model_name: str, batch: list[str]) -> None:
+        tokens = indexing._estimate_embedding_tokens(batch)
+        reservations.append(tokens)
+        assert tokens <= indexing._EMBEDDING_TPM_LIMIT
+
+    with (
+        patch.object(indexing.settings, "DATA_DIR", tmp_path),
+        patch("paperless_ai.indexing._embedding_requires_pacing", return_value=True),
+        patch("paperless_ai.indexing._reserve_embedding_capacity", side_effect=reserve),
+    ):
+        indexing._embed_nodes(nodes, model, model_name="fake-openai-embedding")
+
+    assert [len(batch) for batch in batches] == [1, 1, 1]
+    assert len(reservations) == 3
+    assert all(node.embedding == [0.1] for node in nodes)
+
+
+def test_reservation_rejects_impossible_metered_batch(tmp_path: Path) -> None:
+    with patch.object(indexing.settings, "DATA_DIR", tmp_path):
+        with pytest.raises(ValueError, match="single embedding batch"):
+            indexing._reserve_embedding_capacity(
+                "fake-openai-embedding",
+                ["x" * (indexing._EMBEDDING_TPM_LIMIT * 3 + 1)],
+            )
+
+
+def test_reservation_deferral_is_distinct_from_provider_rate_limit(
+    tmp_path: Path,
+) -> None:
+    with patch.object(indexing.settings, "DATA_DIR", tmp_path):
+        pacing = indexing._embedding_pacing_path("fake-openai-embedding")
+        pacing.parent.mkdir(parents=True, exist_ok=True)
+        pacing.write_text('{"last_request": 9999999999, "events": []}')
+        with pytest.raises(EmbeddingCapacityDeferred):
+            indexing._reserve_embedding_capacity("fake-openai-embedding", ["text"])
+
+
+@pytest.mark.django_db
+def test_repeated_local_capacity_deferrals_do_not_consume_provider_attempts(
+    mocker: pytest_mock.MockerFixture,
+) -> None:
+    """Local pacing must remain retryable beyond the provider retry budget."""
+
+    class RetrySent(Exception):
+        pass
+
+    retry_calls: list[dict[str, object]] = []
+    clock = [100.0]
+
+    document = DocumentFactory()
+    index_update = mocker.patch(
+        "documents.tasks.llm_index_add_or_update_document",
+        side_effect=[EmbeddingCapacityDeferred(1)] * 4 + [None],
+    )
+    mocker.patch("documents.tasks.time.time", side_effect=lambda: clock[0])
+
+    def retry(**kwargs: object) -> None:
+        retry_calls.append(kwargs)
+        raise RetrySent
+
+    mocker.patch.object(update_document_in_llm_index, "retry", side_effect=retry)
+
+    retry_kwargs: dict[str, object] = {
+        "document_id": document.pk,
+        "provider_attempts": 0,
+    }
+    for _ in range(4):
+        with pytest.raises(RetrySent):
+            update_document_in_llm_index.run(**retry_kwargs)
+        retry_kwargs = retry_calls[-1]["kwargs"]
+        clock[0] = float(retry_kwargs["not_before"]) + 1
+
+    update_document_in_llm_index.run(**retry_kwargs)
+
+    assert len(retry_calls) == 4
+    assert [call["kwargs"]["provider_attempts"] for call in retry_calls] == [0] * 4
+    assert index_update.call_count == 5
+
+
+@pytest.mark.django_db
+@override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")
+def test_bulk_local_capacity_deferrals_do_not_consume_provider_attempts(
+    mocker: pytest_mock.MockerFixture,
+) -> None:
+    """Bulk indexing keeps retrying local pacing without provider attempts."""
+
+    class RetrySent(Exception):
+        pass
+
+    retry_calls: list[dict[str, object]] = []
+    clock = [100.0]
+    promoted = EmbeddingCapacityDeferred(1)
+    promoted.full_rebuild = True
+    index_update = mocker.patch(
+        "paperless_ai.indexing.update_llm_index",
+        side_effect=[
+            promoted,
+            EmbeddingCapacityDeferred(1),
+            EmbeddingCapacityDeferred(1),
+            EmbeddingCapacityDeferred(1),
+            None,
+        ],
+    )
+    mocker.patch("documents.tasks.time.time", side_effect=lambda: clock[0])
+
+    def retry(**kwargs: object) -> None:
+        retry_calls.append(kwargs)
+        raise RetrySent
+
+    mocker.patch.object(llmindex_index, "retry", side_effect=retry)
+    retry_kwargs: dict[str, object] = {
+        "rebuild": False,
+        "document_ids": [1, 2],
+        "provider_attempts": 0,
+    }
+    for _ in range(4):
+        with pytest.raises(RetrySent):
+            llmindex_index.run(**retry_kwargs)
+        retry_kwargs = retry_calls[-1]["kwargs"]
+        clock[0] = float(retry_kwargs["not_before"]) + 1
+
+    llmindex_index.run(**retry_kwargs)
+    assert len(retry_calls) == 4
+    assert [call["kwargs"]["provider_attempts"] for call in retry_calls] == [0] * 4
+    assert retry_calls[0]["kwargs"]["document_ids"] is None
+    assert index_update.call_count == 5
+
+
+def test_metered_checkpoint_retry_only_reembeds_remaining_batches(
+    tmp_path: Path,
+) -> None:
+    class Node:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.embedding = None
+
+        def get_content(self, *, metadata_mode) -> str:
+            return self.text
+
+    nodes = [Node("a" * 40_000), Node("b" * 40_000), Node("c" * 40_000)]
+    provider_calls: list[list[str]] = []
+
+    def embed(batch: list[str]) -> list[list[float]]:
+        provider_calls.append(batch)
+        if len(provider_calls) == 2:
+            raise EmbeddingRateLimitError(60)
+        return [[float(len(provider_calls))] for _ in batch]
+
+    reservations = 0
+
+    def reserve(_model_name: str, batch: list[str]) -> None:
+        nonlocal reservations
+        reservations += 1
+        assert (
+            indexing._estimate_embedding_tokens(batch) <= indexing._EMBEDDING_TPM_LIMIT
+        )
+
+    model = MagicMock(embed_batch_size=100)
+    model.get_text_embedding_batch.side_effect = embed
+
+    with (
+        patch.object(indexing.settings, "DATA_DIR", tmp_path),
+        patch("paperless_ai.indexing._embedding_requires_pacing", return_value=True),
+        patch("paperless_ai.indexing._reserve_embedding_capacity", side_effect=reserve),
+    ):
+        with pytest.raises(EmbeddingRateLimitError):
+            indexing._embed_nodes(nodes, model, model_name="fake-openai-embedding")
+        indexing._embed_nodes(nodes, model, model_name="fake-openai-embedding")
+
+    assert provider_calls == [
+        [nodes[0].text],
+        [nodes[1].text],
+        [nodes[1].text],
+        [nodes[2].text],
+    ]
+    assert reservations == 4
+    # The first successful batch is restored from its checkpoint; only the
+    # failed batch and the batches after it are submitted again.
+    assert [node.embedding for node in nodes] == [[1.0], [3.0], [4.0]]
+
+
+@pytest.mark.parametrize(
+    ("module", "model_name", "allowlist", "expected"),
+    [
+        ("llama_index.embeddings.openai_like", "qwen-local", "qwen-local", False),
+        (
+            "llama_index.embeddings.openai_like",
+            "gemini-embedding-001",
+            "qwen-local",
+            True,
+        ),
+        ("llama_index.embeddings.openai_like", "gemini-embedding-001", None, True),
+        ("llama_index.embeddings.openai_like", None, "qwen-local", True),
+        ("llama_index.embeddings.openai_like", "gemini-embedding-001", " , , ", True),
+        ("llama_index.embeddings.ollama", "qwen-local", "qwen-local", False),
+        ("llama_index.embeddings.huggingface", "qwen-local", "qwen-local", False),
+    ],
+)
+def test_embedding_pacing_allowlist_is_exact_and_openai_only(
+    monkeypatch,
+    module: str,
+    model_name: str | None,
+    allowlist: str | None,
+    *,
+    expected: bool,
+) -> None:
+    if allowlist is None:
+        monkeypatch.delenv("PAPERLESS_AI_UNMETERED_EMBEDDING_MODELS", raising=False)
+    else:
+        monkeypatch.setenv("PAPERLESS_AI_UNMETERED_EMBEDDING_MODELS", allowlist)
+    attrs = {"__module__": module}
+    if model_name is not None:
+        attrs["model_name"] = model_name
+    embed_model = type("FakeEmbedding", (), attrs)()
+
+    assert indexing._embedding_requires_pacing(embed_model) is expected
+
+
+def test_embed_nodes_uses_configured_alias_for_local_openai_compatible_model(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("PAPERLESS_AI_UNMETERED_EMBEDDING_MODELS", "qwen-local")
+
+    class Node:
+        embedding = None
+
+        def get_content(self, *, metadata_mode) -> str:
+            return "x" * (indexing._EMBEDDING_TPM_LIMIT * 3 + 1)
+
+    class OpenAILikeFake:
+        __module__ = "llama_index.embeddings.openai_like"
+        model_name = "gemini-embedding-001"
+        embed_batch_size = 1
+
+        def get_text_embedding_batch(self, texts: list[str]) -> list[list[float]]:
+            return [[0.1] for _ in texts]
+
+    model = OpenAILikeFake()
+    nodes = [Node()]
+    with (
+        patch.object(indexing.settings, "DATA_DIR", tmp_path),
+        patch("paperless_ai.indexing._reserve_embedding_capacity") as reserve,
+    ):
+        indexing._embed_nodes(nodes, model, model_name="qwen-local")
+
+    reserve.assert_not_called()
+    assert nodes[0].embedding == [0.1]
 
 
 @pytest.fixture
@@ -723,9 +1030,27 @@ class TestDocumentUpdatedSignalTriggersLlmReindex:
         mock_task = mocker.patch("documents.tasks.update_document_in_llm_index")
 
         doc = DocumentFactory()
-        document_updated.send(sender=object, document=doc)
+        with TestCase.captureOnCommitCallbacks(execute=True):
+            document_updated.send(sender=object, document=doc)
 
-        mock_task.apply_async.assert_called_once_with(kwargs={"document": doc})
+        mock_task.apply_async.assert_called_once_with(kwargs={"document_id": doc.pk})
+
+    @pytest.mark.django_db
+    @override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")
+    def test_document_updated_does_not_enqueue_before_rollback(
+        self,
+        mocker: pytest_mock.MockerFixture,
+    ) -> None:
+        mock_task = mocker.patch("documents.tasks.update_document_in_llm_index")
+        doc = DocumentFactory()
+        with TestCase.captureOnCommitCallbacks(execute=False) as callbacks:
+            with pytest.raises(RuntimeError, match="rollback"):
+                with transaction.atomic():
+                    document_updated.send(sender=object, document=doc)
+                    mock_task.apply_async.assert_not_called()
+                    raise RuntimeError("rollback")
+        assert callbacks == []
+        mock_task.apply_async.assert_not_called()
 
     @pytest.mark.django_db
     @override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")
@@ -737,14 +1062,15 @@ class TestDocumentUpdatedSignalTriggersLlmReindex:
         mock_task = mocker.patch("documents.tasks.update_document_in_llm_index")
 
         root_doc = DocumentFactory()
-        document_consumption_finished.send(
-            sender=object,
-            document=root_doc,
-            logging_group=None,
-            classifier=None,
-            original_file=None,
-        )
-        document_updated.send(sender=object, document=root_doc, skip_ai_index=True)
+        with TestCase.captureOnCommitCallbacks(execute=True):
+            document_consumption_finished.send(
+                sender=object,
+                document=root_doc,
+                logging_group=None,
+                classifier=None,
+                original_file=None,
+            )
+            document_updated.send(sender=object, document=root_doc, skip_ai_index=True)
 
         assert mock_task.apply_async.call_count == 1
 
