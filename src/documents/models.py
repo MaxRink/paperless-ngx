@@ -1,5 +1,6 @@
 import datetime
 import uuid
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Final
 
@@ -11,9 +12,11 @@ from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator
 from django.core.validators import MinValueValidator
 from django.db import models
+from django.db import router
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from multiselectfield import MultiSelectField
+from treenode.cache import clear_cache
 from treenode.models import TreeNodeModel
 
 if settings.AUDIT_LOG_ENABLED:
@@ -100,6 +103,10 @@ class Correspondent(MatchingModel):
         verbose_name_plural = _("correspondents")
 
 
+# Set while saving a tag whose position in the tree is unchanged.
+_skip_tag_tree_update = ContextVar("skip_tag_tree_update", default=False)
+
+
 class Tag(MatchingModel, TreeNodeModel):
     color = models.CharField(_("color"), max_length=7, default="#a6cee3")
     # Maximum allowed nesting depth for tags (root = 1, max depth = 5)
@@ -114,9 +121,60 @@ class Tag(MatchingModel, TreeNodeModel):
         ),
     )
 
+    # The fields django-treenode derives the tree and its order from.
+    TREE_FIELDS: Final[tuple[str, ...]] = ("name", "tn_parent_id", "tn_priority")
+
     class Meta(MatchingModel.Meta, TreeNodeModel.Meta):
         verbose_name = _("tag")
         verbose_name_plural = _("tags")
+
+    def save(self, *args, **kwargs) -> None:
+        """
+        django-treenode rebuilds the whole tag tree after every save. Skip the
+        rebuild when the tree fields are unchanged (e.g. color, matching or
+        inbox changes) and do not write the tree bookkeeping fields, which
+        may be stale on this instance.
+        """
+        if self._state.adding or args or not self._tree_fields_unchanged(kwargs):
+            return super().save(*args, **kwargs)
+        update_fields = kwargs.get("update_fields")
+        kwargs["update_fields"] = [
+            field.name
+            for field in self._meta.concrete_fields
+            if not field.primary_key
+            and not field.name.startswith("tn_")
+            and (
+                update_fields is None
+                or field.name in update_fields
+                or field.attname in update_fields
+            )
+        ]
+        token = _skip_tag_tree_update.set(True)
+        try:
+            super().save(*args, **kwargs)
+        finally:
+            _skip_tag_tree_update.reset(token)
+        # The tree cache holds full tag instances.
+        clear_cache(type(self))
+
+    def _tree_fields_unchanged(self, save_kwargs) -> bool:
+        using = save_kwargs.get("using") or router.db_for_write(
+            type(self),
+            instance=self,
+        )
+        stored = (
+            type(self)
+            ._base_manager.using(using)
+            .filter(pk=self.pk)
+            .values_list(*self.TREE_FIELDS)
+            .first()
+        )
+        return stored == tuple(getattr(self, field) for field in self.TREE_FIELDS)
+
+    @classmethod
+    def update_tree(cls) -> None:
+        if not _skip_tag_tree_update.get():
+            super().update_tree()
 
     def clean(self) -> None:
         # Prevent self-parenting and assigning a descendant as parent

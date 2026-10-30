@@ -2,6 +2,7 @@ from unittest import mock
 
 from rest_framework import status
 from rest_framework.test import APITestCase
+from treenode.models import TreeNodeModel
 
 from documents import bulk_edit
 from documents.models import Document
@@ -322,6 +323,64 @@ class TestTagHierarchy(DirectoriesMixin, APITestCase):
         assert resp_ok.status_code in (200, 202)
         x.refresh_from_db()
         assert x.parent_pk == c.id
+
+    def test_metadata_only_save_skips_tree_rebuild(self) -> None:
+        """
+        GIVEN:
+            - An existing child tag
+        WHEN:
+            - Only fields outside the tree structure change
+        THEN:
+            - The change is saved without rebuilding the tag tree
+        """
+        with mock.patch.object(TreeNodeModel, "update_tree") as update_tree:
+            self.child.color = "#000000"
+            self.child.is_inbox_tag = True
+            self.child.save()
+
+        update_tree.assert_not_called()
+        self.child.refresh_from_db()
+        assert self.child.color == "#000000"
+        assert self.child.is_inbox_tag
+        assert self.child.tn_parent == self.parent
+
+    def test_tree_field_save_rebuilds_tree(self) -> None:
+        """
+        GIVEN:
+            - An existing child tag
+        WHEN:
+            - Its name (part of the tree order) or its parent changes
+        THEN:
+            - The tag tree is rebuilt
+        """
+        with mock.patch.object(TreeNodeModel, "update_tree") as update_tree:
+            self.child.name = "Renamed"
+            self.child.save()
+            update_tree.assert_called_once()
+
+            update_tree.reset_mock()
+            self.child.tn_parent = None
+            self.child.save()
+            update_tree.assert_called_once()
+
+    def test_metadata_only_save_keeps_tree_bookkeeping(self) -> None:
+        """
+        GIVEN:
+            - A tag instance loaded before a sibling was added
+        WHEN:
+            - Only its color is changed and saved
+        THEN:
+            - The tree fields updated by the sibling are not overwritten
+        """
+        stale_child = Tag.objects.get(pk=self.child.pk)
+        Tag.objects.create(name="Sibling", tn_parent=self.parent)
+
+        stale_child.color = "#000000"
+        stale_child.save()
+
+        self.child.refresh_from_db()
+        assert self.child.color == "#000000"
+        assert self.child.tn_siblings_count == 1
 
     def test_is_root_filter_returns_only_root_tags(self) -> None:
         other_root = Tag.objects.create(name="Other parent")
