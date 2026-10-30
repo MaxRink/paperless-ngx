@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 import pytest_mock
 from django.db import connection
+from django.db import transaction
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -718,33 +719,59 @@ class TestDocumentUpdatedSignalTriggersLlmReindex:
     def test_document_updated_enqueues_llm_reindex(
         self,
         mocker: pytest_mock.MockerFixture,
+        django_capture_on_commit_callbacks,
     ) -> None:
         """Firing document_updated should call update_document_in_llm_index.apply_async."""
         mock_task = mocker.patch("documents.tasks.update_document_in_llm_index")
 
         doc = DocumentFactory()
-        document_updated.send(sender=object, document=doc)
+        with django_capture_on_commit_callbacks(execute=True):
+            document_updated.send(sender=object, document=doc)
 
-        mock_task.apply_async.assert_called_once_with(kwargs={"document": doc})
+        mock_task.apply_async.assert_called_once_with(kwargs={"document_id": doc.pk})
+
+    @pytest.mark.django_db
+    @override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")
+    def test_document_updated_does_not_enqueue_before_rollback(
+        self,
+        mocker: pytest_mock.MockerFixture,
+        django_capture_on_commit_callbacks,
+    ) -> None:
+        """The LLM index task must not be queued for a transaction that rolls back."""
+        mock_task = mocker.patch("documents.tasks.update_document_in_llm_index")
+
+        doc = DocumentFactory()
+        with django_capture_on_commit_callbacks(execute=True):
+            with pytest.raises(RuntimeError), transaction.atomic():
+                document_updated.send(sender=object, document=doc)
+                raise RuntimeError
+
+        mock_task.apply_async.assert_not_called()
 
     @pytest.mark.django_db
     @override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")
     def test_version_addition_consumption_enqueues_llm_index_once(
         self,
         mocker: pytest_mock.MockerFixture,
+        django_capture_on_commit_callbacks,
     ) -> None:
         """When a new version is consumed, the root document must be enqueued exactly once."""
         mock_task = mocker.patch("documents.tasks.update_document_in_llm_index")
 
         root_doc = DocumentFactory()
-        document_consumption_finished.send(
-            sender=object,
-            document=root_doc,
-            logging_group=None,
-            classifier=None,
-            original_file=None,
-        )
-        document_updated.send(sender=object, document=root_doc, skip_ai_index=True)
+        with django_capture_on_commit_callbacks(execute=True):
+            document_consumption_finished.send(
+                sender=object,
+                document=root_doc,
+                logging_group=None,
+                classifier=None,
+                original_file=None,
+            )
+            document_updated.send(
+                sender=object,
+                document=root_doc,
+                skip_ai_index=True,
+            )
 
         assert mock_task.apply_async.call_count == 1
 

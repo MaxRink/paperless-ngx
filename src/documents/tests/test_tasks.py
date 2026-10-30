@@ -452,8 +452,59 @@ class TestAIIndex(DirectoriesMixin, TestCase):
         with mock.patch(
             "paperless_ai.indexing.llm_index_add_or_update_document",
         ) as llm_index_add_or_update_document:
-            tasks.update_document_in_llm_index(doc)
+            tasks.update_document_in_llm_index(doc.pk)
             llm_index_add_or_update_document.assert_called_once_with(doc)
+
+    def test_update_document_in_llm_index_legacy_document_kwarg(self) -> None:
+        """
+        GIVEN:
+            - A task queued by an older version with a document instance
+        WHEN:
+            - update_document_in_llm_index task is called
+        THEN:
+            - The document is reloaded and indexed
+        """
+        doc = Document.objects.create(
+            title="test",
+            content="my document",
+            checksum="wow",
+        )
+        with mock.patch(
+            "paperless_ai.indexing.llm_index_add_or_update_document",
+        ) as llm_index_add_or_update_document:
+            tasks.update_document_in_llm_index(document=doc)
+            llm_index_add_or_update_document.assert_called_once_with(doc)
+
+    def test_update_document_in_llm_index_skips_deleted_document(self) -> None:
+        """
+        GIVEN:
+            - A document that is trashed and one that is deleted after the task
+              was queued
+        WHEN:
+            - update_document_in_llm_index task is called
+        THEN:
+            - Neither document is written to the LLM index
+        """
+        trashed = Document.objects.create(
+            title="trashed",
+            content="my document",
+            checksum="trashed",
+        )
+        deleted = Document.objects.create(
+            title="deleted",
+            content="my document",
+            checksum="deleted",
+        )
+        deleted_pk = deleted.pk
+        trashed.delete()
+        deleted.delete()
+        Document.deleted_objects.filter(pk=deleted_pk).delete()
+        with mock.patch(
+            "paperless_ai.indexing.llm_index_add_or_update_document",
+        ) as llm_index_add_or_update_document:
+            tasks.update_document_in_llm_index(trashed.pk)
+            tasks.update_document_in_llm_index(deleted_pk)
+            llm_index_add_or_update_document.assert_not_called()
 
     def test_remove_document_from_llm_index(self) -> None:
         """

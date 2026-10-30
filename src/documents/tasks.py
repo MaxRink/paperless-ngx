@@ -796,11 +796,26 @@ def apply_ai_suggestions(self, action_id: int, document_id: int) -> None:
 
     ai_config = AIConfig()
     if ai_config.llm_index_enabled:
-        update_document_in_llm_index.apply_async(kwargs={"document": document})
+        update_document_in_llm_index.apply_async(kwargs={"document_id": document.pk})
 
 
 @shared_task
-def update_document_in_llm_index(document) -> None:
+def update_document_in_llm_index(
+    document_id: int | None = None,
+    document: Document | None = None,
+) -> None:
+    # ``document`` is still accepted for tasks queued by older versions.
+    if document is not None:
+        document_id = document.pk
+    try:
+        document = Document.objects.get(pk=document_id)
+    except Document.DoesNotExist:
+        logger.debug(
+            "Document %s no longer exists, skipping LLM index update",
+            document_id,
+        )
+        return
+
     from paperless_ai.indexing import llm_index_add_or_update_document
 
     llm_index_add_or_update_document(document)
