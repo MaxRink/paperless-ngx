@@ -59,6 +59,8 @@ def get_embedding_model(
                 timeout=config.llm_request_timeout,
                 http_client=http_client,
                 async_http_client=async_http_client,
+                # Paperless owns retry/defer decisions for metered embedding calls.
+                max_retries=0,
             )
         case LLMEmbeddingBackend.HUGGINGFACE:
             from llama_index.embeddings.huggingface import HuggingFaceEmbedding

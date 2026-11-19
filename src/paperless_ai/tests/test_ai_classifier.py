@@ -572,8 +572,8 @@ def test_get_taxonomy_context_uses_vector_path_when_embedding_backend_configured
 
 class TestGetTaxonomyContextVisibility:
     """get_taxonomy_context must not materialize every visible document id
-    for a user who can already see the whole library: a superuser (like no
-    user at all) gets document_ids=None (no restriction) straight through to
+    for a user who can already see the whole library: an active superuser gets
+    document_ids=None (no restriction) straight through to
     retrieve_similar_nodes(), instead of a full-library IN filter that is
     wasteful at best and, past ~32,763 documents, a hard
     sqlite3.OperationalError at worst (SQLite's bound-parameter limit). Ports
