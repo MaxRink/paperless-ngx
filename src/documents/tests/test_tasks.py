@@ -325,7 +325,7 @@ class TestUpdateContent(DirectoriesMixin, TestCase):
         )
 
     @override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")
-    @mock.patch("paperless_ai.indexing.llm_index_add_or_update_document")
+    @mock.patch("documents.tasks.update_document_in_llm_index")
     @mock.patch("documents.search.get_backend")
     def test_update_content_version_updates_llm_index(
         self,
@@ -339,13 +339,16 @@ class TestUpdateContent(DirectoriesMixin, TestCase):
         WHEN:
             - Update content task is called for the version
         THEN:
-            - The LLM index is updated
+            - One LLM index update task is enqueued for the version (local
+              overlay: embedding quota waits stay out of this task)
         """
         _, version = self._create_root_with_version()
 
         tasks.update_document_content_maybe_archive_file(version.pk)
 
-        mock_llm_index.assert_called_once()
+        mock_llm_index.apply_async.assert_called_once_with(
+            kwargs={"document_id": version.pk},
+        )
 
 
 class TestUpdateContentRemoteOCR(DirectoriesMixin, TestCase):
